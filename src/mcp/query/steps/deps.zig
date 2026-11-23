@@ -59,7 +59,7 @@ pub fn run(ctx: *shared.Context, step: *const std.json.ObjectMap, step_i: usize)
                 if (fwd) |deps| {
                     var res: std.ArrayList([]const u8) = .empty;
                     for (deps) |dep| {
-                        const resolved = @import("../../../explore/deps.zig").resolveDependency(ctx.explorer, path, dep) orelse dep;
+                        const resolved = @import("../../../explore/deps.zig").displayDependency(ctx.explorer, path, dep) orelse continue;
                         const d = ctx.alloc.dupe(u8, resolved) catch continue;
                         res.append(ctx.alloc, d) catch {
                             ctx.alloc.free(d);

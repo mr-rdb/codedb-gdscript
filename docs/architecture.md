@@ -173,6 +173,7 @@ src/
 ├── fsharp_parser.zig         # F# parser (imports ident_utils for shared helpers)
 ├── tsql_parser.zig           # T-SQL parser (imports ident_utils for shared helpers)
 ├── ssrs_parser.zig           # SSRS/RDL parser
+├── godot_parser.zig          # GDScript, .tscn/.tres, and project.godot parser (scene wiring, references)
 ├── t4_parser.zig             # T4 template parser
 ├── autumn_parser.zig         # Autumn Equinox mapping parser
 ├── nuke.zig                  # nuke command

@@ -1079,7 +1079,7 @@ pub fn collectCallers(explorer: *Explorer, alloc: std.mem.Allocator, name: []con
             errdefer alloc.free(path_copy);
             const text_copy = try alloc.dupe(u8, line);
             errdefer alloc.free(text_copy);
-            const scope_name = if (scope) |s| try alloc.dupe(u8, s.name) else null;
+            const scope_name = if (scope) |s| try scopeLabel(alloc, lang, s) else null;
             errdefer if (scope_name) |n| alloc.free(n);
             try result.append(alloc, .{ .path = path_copy, .line_num = line_num, .line_text = text_copy, .scope_name = scope_name, .scope_kind = if (scope) |s| s.kind else null, .scope_start = if (scope) |s| s.line_start else 0, .scope_end = if (scope) |s| s.line_end else 0 });
             if (result.items.len >= limit) return result.toOwnedSlice(alloc);
@@ -1399,11 +1399,25 @@ fn isInsideStringOrComment(line: []const u8, pos: usize, lang: explore_mod.Langu
             continue;
         }
         if (c == '/' and i + 1 < line.len and line[i + 1] == '/') return true;
-        if (lang == .python or lang == .ruby or lang == .shell) {
+        if (lang == .python or lang == .ruby or lang == .shell or lang == .gdscript) {
             if (c == '#') return true;
         }
     }
     return quote != 0;
+}
+
+/// Caller scope label. A scene connection reads `pressed -> _on_pressed (scripts/x.gd)`
+/// so an editor-wired handler shows its wiring, not only the signal name.
+fn scopeLabel(alloc: std.mem.Allocator, lang: explore_mod.Language, sym: explore_mod.Symbol) ![]u8 {
+    if (lang == .godot_scene and sym.kind == .variable) {
+        if (sym.detail) |detail| {
+            var buf: [512]u8 = undefined;
+            if (@import("../godot_parser.zig").connectionLabel(sym.name, detail, &buf)) |label| {
+                return alloc.dupe(u8, label);
+            }
+        }
+    }
+    return alloc.dupe(u8, sym.name);
 }
 
 /// Languages where the concept of a "call site" is meaningful. Excludes
@@ -1461,7 +1475,7 @@ pub fn handleDeps(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out
             if (fwd) |deps| {
                 var result_list: std.ArrayList([]const u8) = .empty;
                 for (deps) |dep| {
-                    const resolved = @import("../explore/deps.zig").resolveDependency(explorer, path, dep) orelse dep;
+                    const resolved = @import("../explore/deps.zig").displayDependency(explorer, path, dep) orelse continue;
                     const d = alloc.dupe(u8, resolved) catch continue;
                     result_list.append(alloc, d) catch {
                         alloc.free(d);

@@ -176,8 +176,34 @@ pub fn computeSymbolEnds(content: []const u8, outline: *FileOutline) void {
             sym.line_end = findPythonEnd(content, line_offsets.items, sym.line_start, total_lines);
         } else if (outline.language == .ruby) {
             sym.line_end = findRubyEnd(content, line_offsets.items, sym.line_start, total_lines);
+        } else if (outline.language == .gdscript) {
+            sym.line_end = findGdScriptEnd(content, line_offsets.items, sym.kind, sym.detail, sym.line_start, total_lines);
         }
     }
+}
+
+/// GDScript blocks are indentation-based, like Python. Two shapes differ:
+/// `enum` bodies are brace-delimited, and a `class_name` header is one line
+/// (its body is the rest of the file's top-level declarations, which the
+/// outline already lists separately).
+pub fn findGdScriptEnd(
+    content: []const u8,
+    line_offsets: []const usize,
+    kind: SymbolKind,
+    detail: ?[]const u8,
+    line_start: u32,
+    total_lines: u32,
+) u32 {
+    switch (kind) {
+        .enum_def => return findBraceEnd(content, line_offsets, line_start, total_lines, .gdscript),
+        .class_def => {
+            if (detail) |d| {
+                if (std.mem.startsWith(u8, d, "class_name ")) return line_start;
+            }
+        },
+        else => {},
+    }
+    return findPythonEnd(content, line_offsets, line_start, total_lines);
 }
 
 pub fn findBraceEnd(content: []const u8, line_offsets: []const usize, line_start: u32, total_lines: u32, language: Language) u32 {
@@ -453,6 +479,9 @@ pub fn parseOutlineWithParser(parser: *Explorer, path: []const u8, content: []co
     var in_razor_code_block: bool = false;
     var razor_brace_depth: u32 = 0;
     var gd_state: godot_parser.GdState = .{};
+    var scene_arena = std.heap.ArenaAllocator.init(parser.allocator);
+    defer scene_arena.deinit();
+    var scene_wiring = godot_parser.SceneWiring.init(scene_arena.allocator());
     var godot_project_section: godot_parser.ProjectSection = .none;
     var gd_pending_decorators: std.ArrayList([]const u8) = .empty;
     defer {
@@ -919,6 +948,7 @@ pub fn parseOutlineWithParser(parser: *Explorer, path: []const u8, content: []co
                 },
             }
         } else if (outline.language == .godot_scene or outline.language == .godot_resource) {
+            try scene_wiring.observe(trimmed);
             const result = godot_parser.parseSceneLine(trimmed);
             switch (result) {
                 .none => {},
@@ -929,9 +959,13 @@ pub fn parseOutlineWithParser(parser: *Explorer, path: []const u8, content: []co
                         .connection => .variable,
                         else => unreachable,
                     };
-                    var detail_buf: [256]u8 = undefined;
-                    const structured = godot_parser.extractDetail(trimmed, sym.kind, &detail_buf);
-                    const detail = if (structured.len > 0) structured else trimmed;
+                    var detail_buf: [512]u8 = undefined;
+                    const detail = if (sym.kind == .connection)
+                        scene_wiring.connectionDetail(trimmed, &detail_buf)
+                    else blk: {
+                        const structured = godot_parser.extractDetail(trimmed, sym.kind, &detail_buf);
+                        break :blk if (structured.len > 0) structured else trimmed;
+                    };
                     try appendOutlineSymbol(parser.allocator, &outline, sym.name, sk, line_num, detail);
                 },
                 .import => |imp| {
@@ -953,6 +987,13 @@ pub fn parseOutlineWithParser(parser: *Explorer, path: []const u8, content: []co
                 },
                 .import => |imp| {
                     try appendImportSymbol(parser.allocator, &outline, imp.path, line_num, trimmed);
+                    // An autoload is a global singleton used by name (`Travel.foo()`),
+                    // so its name is a symbol too; it resolves to the script above.
+                    if (godot_project_section == .autoload) {
+                        if (godot_parser.autoloadName(trimmed)) |name| {
+                            try appendOutlineSymbol(parser.allocator, &outline, name, .variable, line_num, trimmed);
+                        }
+                    }
                 },
             }
         }

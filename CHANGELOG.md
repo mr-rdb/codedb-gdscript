@@ -3,6 +3,26 @@
 
 ## Unreleased
 
+### Godot 4 and GDScript
+
+- **GDScript** (`.gd`) files get outlines for `func`, `signal`, `var` (with `@export`), `const`, `enum`,
+  `class_name`, inner classes, and decorators. Function, inner-class, and enum bodies span their real
+  line range, so `codedb_symbol` with `body=true` returns the whole body.
+- **Scenes and resources** (`.tscn`, `.tres`) list the node tree and `ext_resource` imports. Each
+  `[connection]` records the script that handles its signal, and a caller of that handler reads as
+  `pressed -> _on_pressed (scripts/x.gd)`.
+- **`project.godot`** lists `[autoload]` singletons, which resolve to their scripts, and `[input]` actions.
+  The file is matched by its exact name.
+- **Dependency edges** now cover `preload`/`load` with either quote style, `extends`, `ext_resource`,
+  autoloads, `class_name` type annotations (`var x: Foo`, `-> Foo`), and `Foo.member` calls to a class or
+  autoload. `res://` paths resolve against the nearest `project.godot`, so nested projects stay separate
+  and a shared name resolves inside the project that holds the file.
+- **`codedb_callers`** ignores `#` comments and strings in GDScript.
+- **Ignore rules**: `.mono/` joins `.godot/` and `.import/`, and any directory holding a `.gdignore`
+  file is skipped, as Godot does. Both the initial scan and incremental updates honor it.
+- After upgrading, restart the MCP server and run `codedb_index` with `force=true`. Symbol spans for
+  GDScript change, and cached indexes are keyed by path.
+
 ### 4.0.0 - 4.0.7 â€” ASP.NET accuracy and reliability
 
 - **`codedb_config_xref`** no longer reports false positives. String constants are resolved by

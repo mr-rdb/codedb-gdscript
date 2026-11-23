@@ -41,7 +41,7 @@ index through MCP to understand your codebase without reading every file.
 When you run `codedb /path/to/project`, it:
 
 1. **Walks** the file tree, skipping `.gitignore`/`.codedbignore` patterns
-2. **Parses** each file with a language-aware parser (C#, F#, Zig, Razor, JS, TS, Python, Go, Rust, and more)
+2. **Parses** each file with a language-aware parser (C#, F#, Zig, Razor, JS, TS, Python, Go, Rust, GDScript and Godot scenes, and more)
 3. **Extracts** symbols — classes, functions, interfaces, enums, imports — with line-precise locations
 4. **Builds** an inverted word index, trigram index, and dependency graph
 5. **Writes** a `codedb.snapshot` (portable, binary) and a central cache at `~/.codedb/projects/`
@@ -119,6 +119,18 @@ flowchart TD
 ```
 
 ---
+
+## Godot 4 projects
+
+codedb indexes GDScript (`.gd`) and Godot's text formats: scenes (`.tscn`), resources (`.tres`), and `project.godot`.
+
+- **Outlines** list `func`, `signal`, `var` (with `@export`), `const`, `enum`, `class_name`, inner classes, and decorators. Function, inner-class, and enum bodies span their real line range, so `codedb_symbol` with `body=true` returns the whole body.
+- **Scenes** list the node tree and every `[connection]`. The connection's target script is recorded, so a caller of a handler shows its wiring, e.g. `pressed -> _on_pressed (scripts/x.gd)`.
+- **Dependencies** (`codedb_deps`) follow `preload`/`load`, `extends`, `ext_resource` entries, and `[autoload]` singletons, all by `res://` path. Paths resolve against the nearest `project.godot`, so nested projects in a monorepo stay separate.
+- **Type and class references** link a file to the declaring `class_name`: `extends Foo`, annotations such as `var x: Foo` or `-> Foo`, and `Foo.member` calls. A `Foo.member` call also links to an autoload named `Foo`.
+- **Ignored**: `.godot/`, `.import/`, and `.mono/` directories; `.uid`, `.import`, and `.translation` files; and any directory holding a `.gdignore` file, which is Godot's own convention.
+
+Limits: only capitalized names count as `Name.member` references, so lowercase autoload names are not linked. A connection is linked only when its target node appears earlier in the file, which is how Godot writes them. Names that appear only in comments and strings are ignored.
 
 ## Prerequisites
 

@@ -95,6 +95,7 @@ test "generatedSkipEvents increments only on generated paths" {
 test "godot: cache dirs and sidecar files are skipped" {
     // Godot 4 cache dir and Godot 3 import cache dir
     try testing.expect(skip_rules.shouldSkipDir(".godot"));
+    try testing.expect(skip_rules.shouldSkipDir(".mono")); // Godot .NET generated cache
     try testing.expect(skip_rules.shouldSkipDir(".import"));
     try testing.expect(skip_rules.shouldSkip("lunch-rush/.godot/imported/icon.png-abc.ctex"));
 

@@ -328,7 +328,8 @@ test "e2e: .tscn yields node tree symbols and script/scene imports" {
 
     const conn = findSymbol(outline, "pressed").?;
     try testing.expectEqual(SymbolKind.variable, conn.kind);
-    try testing.expectEqualStrings("from=StartButton to=. method=_on_start_pressed", conn.detail.?);
+    // `to="."` is the root, whose script is main.gd: the wiring is linked to it.
+    try testing.expectEqualStrings("from=StartButton to=. method=_on_start_pressed script=main.gd", conn.detail.?);
 }
 
 test "e2e: project.godot yields autoload imports and input actions" {
@@ -379,4 +380,463 @@ test "e2e: standalone annotation attaches as decorator to next symbol" {
     const f = findSymbol(outline, "fire_projectile").?;
     try testing.expectEqual(@as(usize, 1), f.decorators.len);
     try testing.expectEqualStrings("@rpc", f.decorators[0]);
+}
+
+// ── Added: symbol spans, comments, class_name and res:// resolution ────────
+
+const deps = @import("../../explore/deps.zig");
+const search_utils = @import("../../explore/search_utils.zig");
+const source_lexical = @import("../../source_lexical.zig");
+const Store = @import("../../store.zig").Store;
+const watcher = @import("../../watcher.zig");
+const FilteredWalker = @import("../../watcher/filtered_walker.zig").FilteredWalker;
+const io = std.testing.io;
+
+fn importPath(result: gp.ParsedLine) ?[]const u8 {
+    return switch (result) {
+        .import => |imp| imp.path,
+        else => null,
+    };
+}
+
+test "gdscript: single-quoted res:// paths in extends, preload and load" {
+    var state: gp.GdState = .{};
+    try testing.expectEqualStrings("base/card.gd", importPath(parseGd("extends 'res://base/card.gd'", &state)).?);
+    try testing.expectEqualStrings("scripts/a.gd", gp.extractResPath("const A = preload('res://scripts/a.gd')").?);
+    try testing.expectEqualStrings("scripts/b.gd", gp.extractResPath("var b = load(\"res://scripts/b.gd\")").?);
+    // ResourceLoader.load is a real call; my_load is an unrelated identifier.
+    try testing.expectEqualStrings("scripts/c.gd", gp.extractResPath("ResourceLoader.load(\"res://scripts/c.gd\")").?);
+    try testing.expect(gp.extractResPath("var x = my_load(\"res://scripts/d.gd\")") == null);
+}
+
+test "gdscript: unterminated or non-res path literals yield nothing" {
+    var state: gp.GdState = .{};
+    try testing.expect(gp.extractResPath("preload(\"res://broken") == null);
+    try testing.expect(gp.extractResPath("load('") == null);
+    try testing.expect(gp.extractResPath("load(\"user://save.dat\")") == null);
+    try testing.expect(importPath(parseGd("extends \"res://unterminated", &state)) == null);
+    try testing.expect(importPath(parseGd("extends '", &state)) == null);
+}
+
+test "gdscript: function, enum and class_name symbols span their real bodies" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var explorer = Explorer.init(arena.allocator());
+
+    try explorer.indexFile("Body.gd",
+        \\class_name Body
+        \\extends Node
+        \\
+        \\enum Mode {
+        \\    IDLE,
+        \\    RUN
+        \\}
+        \\
+        \\func tick(delta: float) -> void:
+        \\    if delta > 0.0:
+        \\        pass
+        \\    # trailing comment
+        \\
+        \\func idle():
+        \\    pass
+        \\
+        \\class Inner:
+        \\    func inner_fn():
+        \\        return 1
+    );
+
+    const outline = explorer.outlines.get("Body.gd").?;
+    const class_sym = findSymbol(outline, "Body").?;
+    try testing.expectEqual(@as(u32, 1), class_sym.line_start);
+    try testing.expectEqual(@as(u32, 1), class_sym.line_end);
+
+    const enum_sym = findSymbol(outline, "Mode").?;
+    try testing.expectEqual(SymbolKind.enum_def, enum_sym.kind);
+    try testing.expectEqual(@as(u32, 4), enum_sym.line_start);
+    try testing.expectEqual(@as(u32, 7), enum_sym.line_end);
+
+    // The trailing comment does not extend the body; the blank line ends it.
+    const tick = findSymbol(outline, "tick").?;
+    try testing.expectEqual(@as(u32, 9), tick.line_start);
+    try testing.expectEqual(@as(u32, 11), tick.line_end);
+
+    const idle = findSymbol(outline, "idle").?;
+    try testing.expectEqual(@as(u32, 14), idle.line_start);
+    try testing.expectEqual(@as(u32, 15), idle.line_end);
+
+    const inner = findSymbol(outline, "Inner").?;
+    try testing.expectEqual(SymbolKind.class_def, inner.kind);
+    try testing.expectEqual(@as(u32, 17), inner.line_start);
+    try testing.expectEqual(@as(u32, 19), inner.line_end);
+
+    const inner_fn = findSymbol(outline, "inner_fn").?;
+    try testing.expectEqual(SymbolKind.method, inner_fn.kind);
+    try testing.expectEqual(@as(u32, 18), inner_fn.line_start);
+    try testing.expectEqual(@as(u32, 19), inner_fn.line_end);
+}
+
+test "gdscript: malformed input keeps every symbol span well-formed" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var explorer = Explorer.init(arena.allocator());
+
+    try explorer.indexFile("Broken.gd",
+        \\func broken(
+        \\    a: int,
+        \\) -> void:
+        \\    var s = "{ not a brace"
+        \\    var t = '''never closed
+        \\enum Open {
+        \\func after():
+        \\    pass
+    );
+
+    const outline = explorer.outlines.get("Broken.gd").?;
+    try testing.expect(outline.symbols.items.len >= 1);
+    for (outline.symbols.items) |sym| {
+        try testing.expect(sym.line_end >= sym.line_start);
+    }
+}
+
+test "gdscript: # comment lines are not code for callers and lexical masking" {
+    try testing.expect(search_utils.isCommentOrBlank("  # old_call()", .gdscript));
+    try testing.expect(!search_utils.isCommentOrBlank("  func real_call():", .gdscript));
+
+    const masked = try source_lexical.mask(testing.allocator, "var a = fake_call() # gone_call()\nfunc real_call():", .gdscript);
+    defer testing.allocator.free(masked);
+    try testing.expect(std.mem.indexOf(u8, masked, "gone_call") == null);
+    try testing.expect(std.mem.indexOf(u8, masked, "fake_call") != null);
+    try testing.expect(std.mem.indexOf(u8, masked, "real_call") != null);
+}
+
+test "project.godot: only the exact file name is a Godot project file" {
+    try testing.expect(explore.detectLanguage("myproject.godot") != .godot_project);
+    try testing.expect(explore.detectLanguage("games/a/project.godot") == .godot_project);
+}
+
+test "gdscript: extends by class_name resolves to the snake_case file that declares it" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var explorer = Explorer.init(arena.allocator());
+
+    try explorer.indexFile("scripts/clay/clay_model.gd", "class_name ClayModel\nextends Node3D\n");
+    try explorer.indexFile("scripts/props/sky_star.gd", "extends ClayModel\n");
+
+    try testing.expectEqualStrings(
+        "scripts/clay/clay_model.gd",
+        deps.resolveDependency(&explorer, "scripts/props/sky_star.gd", "ClayModel").?,
+    );
+
+    const importers = try explorer.getImportedBy("scripts/clay/clay_model.gd", testing.allocator);
+    defer {
+        for (importers) |p| testing.allocator.free(p);
+        testing.allocator.free(importers);
+    }
+    try testing.expectEqual(@as(usize, 1), importers.len);
+    try testing.expectEqualStrings("scripts/props/sky_star.gd", importers[0]);
+}
+
+test "gdscript: ambiguous class_name stays unresolved" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var explorer = Explorer.init(arena.allocator());
+
+    try explorer.indexFile("a/one.gd", "class_name Shared\n");
+    try explorer.indexFile("b/two.gd", "class_name Shared\n");
+    try explorer.indexFile("c/user.gd", "extends Shared\n");
+
+    try testing.expect(deps.resolveDependency(&explorer, "c/user.gd", "Shared") == null);
+}
+
+test "godot: res:// paths resolve against the nested project that holds the importer" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var explorer = Explorer.init(arena.allocator());
+
+    try explorer.indexFile("games/a/project.godot", "[application]\nconfig/name=\"a\"\n");
+    try explorer.indexFile("games/a/scenes/main.tscn", "[ext_resource type=\"Script\" path=\"res://scripts/player.gd\" id=\"1_x\"]\n");
+    try explorer.indexFile("games/a/scripts/player.gd", "extends Node\n");
+    try explorer.indexFile("games/b/scripts/player.gd", "extends Node\n");
+
+    try testing.expectEqualStrings(
+        "games/a/scripts/player.gd",
+        deps.resolveDependency(&explorer, "games/a/scenes/main.tscn", "scripts/player.gd").?,
+    );
+
+    // The same-named file in games/b is not the target of games/a's scene.
+    const importers = try explorer.getImportedBy("games/a/scripts/player.gd", testing.allocator);
+    defer {
+        for (importers) |p| testing.allocator.free(p);
+        testing.allocator.free(importers);
+    }
+    try testing.expectEqual(@as(usize, 1), importers.len);
+    try testing.expectEqualStrings("games/a/scenes/main.tscn", importers[0]);
+}
+
+test "godot: root-level project res:// paths still resolve exactly" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var explorer = Explorer.init(arena.allocator());
+
+    try explorer.indexFile("project.godot", "[application]\n");
+    try explorer.indexFile("scripts/x.gd", "extends Node\n");
+    try explorer.indexFile("scenes/main.tscn", "[ext_resource type=\"Script\" path=\"res://scripts/x.gd\" id=\"1\"]\n");
+
+    try testing.expectEqualStrings("scripts/x.gd", deps.resolveDependency(&explorer, "scenes/main.tscn", "scripts/x.gd").?);
+}
+
+test "godot: .gdignore excludes its directory from the index and from path checks" {
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.createDirPath(io, "keep");
+    try tmp_dir.dir.createDirPath(io, "hidden");
+    try tmp_dir.dir.writeFile(io, .{ .sub_path = "hidden/.gdignore", .data = "" });
+    try tmp_dir.dir.writeFile(io, .{ .sub_path = "hidden/secret.gd", .data = "extends Node\n" });
+    try tmp_dir.dir.writeFile(io, .{ .sub_path = "keep/visible.gd", .data = "extends Node\n" });
+
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp_dir.dir.realPathFile(io, ".", &root_buf);
+    const root = root_buf[0..root_len];
+
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+    var explorer = Explorer.init(testing.allocator);
+    defer explorer.deinit();
+    explorer.setRoot(io, root);
+    try watcher.initialScanWithWorkerCount(io, &store, &explorer, root, testing.allocator, false, 1);
+
+    try testing.expect(explorer.contents.contains("keep/visible.gd"));
+    try testing.expect(!explorer.contents.contains("hidden/secret.gd"));
+
+    try testing.expect(FilteredWalker.allowsPath(io, tmp_dir.dir, "keep/visible.gd", testing.allocator));
+    try testing.expect(!FilteredWalker.allowsPath(io, tmp_dir.dir, "hidden/secret.gd", testing.allocator));
+}
+
+// ── Added: type annotations, receivers, autoloads, scene connections ───────
+
+fn containsPath(list: []const []const u8, path: []const u8) bool {
+    for (list) |p| {
+        if (std.mem.eql(u8, p, path)) return true;
+    }
+    return false;
+}
+
+fn freeImporters(list: []const []const u8) void {
+    for (list) |p| testing.allocator.free(p);
+    testing.allocator.free(list);
+}
+
+test "gdscript: type annotations come from declarations, not initializers" {
+    var out: [gp.max_annotations][]const u8 = undefined;
+
+    try testing.expectEqual(@as(usize, 1), gp.typeAnnotations("var x: ClayBlob = null", &out));
+    try testing.expectEqualStrings("ClayBlob", out[0]);
+
+    // `:=` infers the type, and a dictionary literal's colon is not a type.
+    try testing.expectEqual(@as(usize, 0), gp.typeAnnotations("var y := ClayBlob.new()", &out));
+    try testing.expectEqual(@as(usize, 0), gp.typeAnnotations("var d = {\"k\": ClayBlob}", &out));
+    try testing.expectEqual(@as(usize, 0), gp.typeAnnotations("class Inner:", &out));
+
+    // Return type first, then each parameter; the default value is not read.
+    const n = gp.typeAnnotations("func f(a: ClayBlob, b: Array[Foo], c: int = 3) -> Bar:", &out);
+    try testing.expectEqual(@as(usize, 4), n);
+    try testing.expectEqualStrings("Bar", out[0]);
+    try testing.expectEqualStrings("ClayBlob", out[1]);
+    try testing.expectEqualStrings("Array[Foo]", out[2]);
+    try testing.expectEqualStrings("int", out[3]);
+}
+
+test "gdscript: type names skip namespace qualifiers; builtins are filtered" {
+    const text = "Array[Outer.ClayBlob]";
+    var pos: usize = 0;
+    try testing.expectEqualStrings("Array", gp.nextTypeName(text, &pos).?);
+    try testing.expectEqualStrings("ClayBlob", gp.nextTypeName(text, &pos).?);
+    try testing.expect(gp.nextTypeName(text, &pos) == null);
+
+    try testing.expect(gp.isBuiltinGdType("Vector3"));
+    try testing.expect(gp.isBuiltinGdType("int"));
+    try testing.expect(!gp.isBuiltinGdType("ClayBlob"));
+}
+
+test "gdscript: receivers come from code, not from comments or strings" {
+    const source = "# ClayBlob.old()\nvar s = \"Travel.text\"\nfunc f():\n\tTravel.foo()\n\tvar n = my.Thing\n";
+    const masked = try source_lexical.mask(testing.allocator, source, .gdscript);
+    defer testing.allocator.free(masked);
+
+    var pos: usize = 0;
+    try testing.expectEqualStrings("Travel", gp.nextReceiver(masked, &pos).?);
+    try testing.expect(gp.nextReceiver(masked, &pos) == null);
+}
+
+test "gdscript: typed and receiver references link a user to the class file" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var explorer = Explorer.init(arena.allocator());
+
+    try explorer.indexFile("scripts/clay/clay_blob.gd", "class_name ClayBlob\nextends Node3D\n");
+    try explorer.indexFile("scripts/clay/clay_kit.gd", "class_name ClayKit\nstatic func make():\n\treturn null\n");
+    try explorer.indexFile("scripts/user.gd",
+        \\extends Node
+        \\var blob: ClayBlob
+        \\func build(out: Array[ClayBlob]) -> ClayBlob:
+        \\    return ClayKit.make()
+    );
+    try explorer.indexFile("scripts/comment_only.gd",
+        \\# ClayBlob.new() was removed
+        \\var n = 1
+    );
+
+    const blob_users = try explorer.getImportedBy("scripts/clay/clay_blob.gd", testing.allocator);
+    defer freeImporters(blob_users);
+    try testing.expect(containsPath(blob_users, "scripts/user.gd"));
+    try testing.expect(!containsPath(blob_users, "scripts/comment_only.gd"));
+
+    const kit_users = try explorer.getImportedBy("scripts/clay/clay_kit.gd", testing.allocator);
+    defer freeImporters(kit_users);
+    try testing.expect(containsPath(kit_users, "scripts/user.gd"));
+}
+
+test "gdscript: a file is never a reference dependency of itself" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var explorer = Explorer.init(arena.allocator());
+
+    try explorer.indexFile("scripts/clay_kit.gd", "class_name ClayKit\nfunc make():\n\treturn ClayKit.new()\n");
+
+    const users = try explorer.getImportedBy("scripts/clay_kit.gd", testing.allocator);
+    defer freeImporters(users);
+    try testing.expect(!containsPath(users, "scripts/clay_kit.gd"));
+}
+
+test "gdscript: autoload references resolve to the autoload script" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var explorer = Explorer.init(arena.allocator());
+
+    try explorer.indexFile("project.godot",
+        \\[autoload]
+        \\
+        \\Travel="*res://scripts/travel.gd"
+        \\BackgroundMusic="*res://scripts/music.gd"
+    );
+    try explorer.indexFile("scripts/travel.gd", "extends Node\nfunc foo():\n\tpass\n");
+    try explorer.indexFile("scripts/music.gd", "extends Node\nfunc bar():\n\tpass\n");
+    try explorer.indexFile("scripts/player.gd", "extends Node\nfunc _ready():\n\tTravel.foo()\n\tBackgroundMusic.bar()\n");
+
+    // The autoload name is a symbol of project.godot, pointing at its script.
+    const project = explorer.outlines.get("project.godot").?;
+    const travel = findSymbol(project, "Travel").?;
+    try testing.expectEqual(SymbolKind.variable, travel.kind);
+
+    try testing.expectEqualStrings(
+        "scripts/travel.gd",
+        deps.resolveDependency(&explorer, "scripts/player.gd", "ref:Travel").?,
+    );
+
+    const travel_users = try explorer.getImportedBy("scripts/travel.gd", testing.allocator);
+    defer freeImporters(travel_users);
+    try testing.expect(containsPath(travel_users, "scripts/player.gd"));
+
+    const music_users = try explorer.getImportedBy("scripts/music.gd", testing.allocator);
+    defer freeImporters(music_users);
+    try testing.expect(containsPath(music_users, "scripts/player.gd"));
+}
+
+test "gdscript: an autoload name shared by nested projects resolves inside its own project" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var explorer = Explorer.init(arena.allocator());
+
+    const autoload = "[autoload]\n\nTravel=\"*res://scripts/travel.gd\"\n";
+    try explorer.indexFile("games/a/project.godot", autoload);
+    try explorer.indexFile("games/b/project.godot", autoload);
+    try explorer.indexFile("games/a/scripts/travel.gd", "extends Node\n");
+    try explorer.indexFile("games/b/scripts/travel.gd", "extends Node\n");
+    try explorer.indexFile("games/b/scripts/player.gd", "extends Node\nfunc _ready():\n\tTravel.x()\n");
+
+    try testing.expectEqualStrings(
+        "games/b/scripts/travel.gd",
+        deps.resolveDependency(&explorer, "games/b/scripts/player.gd", "ref:Travel").?,
+    );
+    // Outside both projects the name is ambiguous, so it stays unresolved.
+    try testing.expect(deps.resolveDependency(&explorer, "tools/x.gd", "ref:Travel") == null);
+}
+
+test "gdscript: unresolved references are hidden from forward dependency listings" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var explorer = Explorer.init(arena.allocator());
+
+    try explorer.indexFile("scripts/clay/clay_blob.gd", "class_name ClayBlob\n");
+
+    try testing.expectEqualStrings(
+        "scripts/clay/clay_blob.gd",
+        deps.displayDependency(&explorer, "scripts/user.gd", "ref:ClayBlob").?,
+    );
+    try testing.expect(deps.displayDependency(&explorer, "scripts/user.gd", "ref:Unknown") == null);
+    try testing.expectEqualStrings("Node", deps.displayDependency(&explorer, "scripts/user.gd", "Node").?);
+}
+
+test "gdscript: scene connections link to the target script and label callers" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var explorer = Explorer.init(arena.allocator());
+
+    try explorer.indexFile("Main.tscn",
+        \\[gd_scene format=3]
+        \\
+        \\[ext_resource type="Script" path="res://scripts/main.gd" id="1_abc"]
+        \\[ext_resource type="Script" path="res://scripts/button.gd" id="2_def"]
+        \\
+        \\[node name="Main" type="Node2D"]
+        \\script = ExtResource("1_abc")
+        \\
+        \\[node name="Button" type="Button" parent="."]
+        \\script = ExtResource("2_def")
+        \\
+        \\[node name="Label" type="Label" parent="."]
+        \\
+        \\[connection signal="pressed" from="Button" to="." method="_on_pressed"]
+        \\[connection signal="toggled" from="Button" to="Button" method="_on_toggled"]
+        \\[connection signal="timeout" from="Button" to="Label" method="_missing"]
+        \\[connection signal="broken" from="Button" to="Label" method=]
+    );
+
+    const outline = explorer.outlines.get("Main.tscn").?;
+
+    // The root's script is main.gd; a child's is button.gd. A target without a
+    // script keeps the plain wiring detail.
+    const pressed = findSymbol(outline, "pressed").?;
+    try testing.expectEqualStrings("from=Button to=. method=_on_pressed script=scripts/main.gd", pressed.detail.?);
+    const toggled = findSymbol(outline, "toggled").?;
+    try testing.expectEqualStrings("from=Button to=Button method=_on_toggled script=scripts/button.gd", toggled.detail.?);
+    const timeout = findSymbol(outline, "timeout").?;
+    try testing.expectEqualStrings("from=Button to=Label method=_missing", timeout.detail.?);
+
+    var buf: [256]u8 = undefined;
+    try testing.expectEqualStrings(
+        "pressed -> _on_pressed (scripts/main.gd)",
+        gp.connectionLabel("pressed", pressed.detail.?, &buf).?,
+    );
+    try testing.expectEqualStrings("timeout -> _missing", gp.connectionLabel("timeout", timeout.detail.?, &buf).?);
+    // A method-less connection is not a handler, so it has no wiring label.
+    try testing.expect(gp.connectionLabel("broken", "from=Button to=Label", &buf) == null);
+}
+
+test "gdscript: a connection written before its target node stays unlinked" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var explorer = Explorer.init(arena.allocator());
+
+    try explorer.indexFile("Early.tscn",
+        \\[ext_resource type="Script" path="res://scripts/main.gd" id="1_abc"]
+        \\[connection signal="pressed" from="Button" to="." method="_on_pressed"]
+        \\[node name="Main" type="Node2D"]
+        \\script = ExtResource("1_abc")
+    );
+
+    const outline = explorer.outlines.get("Early.tscn").?;
+    const pressed = findSymbol(outline, "pressed").?;
+    try testing.expectEqualStrings("from=Button to=. method=_on_pressed", pressed.detail.?);
 }

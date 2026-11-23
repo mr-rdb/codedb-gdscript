@@ -9,6 +9,7 @@ const Store = @import("../store.zig").Store;
 const tsql_parser = @import("../tsql_parser.zig");
 const parse_utils = @import("parse_utils.zig");
 const dependency_graph = @import("dependency_graph.zig");
+const godot_parser = @import("../godot_parser.zig");
 
 pub fn findSymbol(self: *Explorer, name: []const u8, allocator: std.mem.Allocator) !?struct { path: []const u8, symbol: Symbol } {
     self.mu.lockShared();
@@ -201,6 +202,56 @@ fn getImportedByLocked(self: *Explorer, path: []const u8, allocator: std.mem.All
             if (!exists) try results.append(allocator, try allocator.dupe(u8, importer.*));
         }
     }
+    // Godot edges need project-aware resolution the basename matcher lacks:
+    // `extends Foo` is keyed by the bare class name, and res:// paths are
+    // relative to the importer's project, where nested projects can share
+    // file names. Only Godot importers produce these keys.
+    var godot_edges = self.dep_graph.reverse.iterator();
+    while (godot_edges.next()) |edge| {
+        const key = edge.key_ptr.*;
+        if (std.mem.startsWith(u8, key, "local:")) continue;
+        if (std.mem.startsWith(u8, key, godot_parser.ref_prefix)) {
+            // Resolution depends on the importer (nested projects), so each
+            // importer resolves on its own.
+            const name = key[godot_parser.ref_prefix.len..];
+            var ref_importers = edge.value_ptr.keyIterator();
+            while (ref_importers.next()) |importer| {
+                const target = resolveGdReference(self, importer.*, name) orelse continue;
+                if (!std.mem.eql(u8, path, target)) continue;
+                var listed = false;
+                for (results.items) |p| if (std.mem.eql(u8, p, importer.*)) {
+                    listed = true;
+                    break;
+                };
+                if (!listed) try results.append(allocator, try allocator.dupe(u8, importer.*));
+            }
+            continue;
+        }
+        const bare = std.mem.indexOfScalar(u8, key, '/') == null;
+        // A res:// key resolves to <project root>/<key>, so it can only name
+        // `path` when `path` ends with the key. Cheap filter before any
+        // per-importer language checks.
+        if (!bare and !std.mem.endsWith(u8, path, key)) continue;
+        const class_target = if (bare) resolveGdClassName(self, key) else null;
+        if (bare and class_target == null) continue;
+        var importers = edge.value_ptr.keyIterator();
+        while (importers.next()) |importer| {
+            const lang = @import("types.zig").detectLanguage(importer.*);
+            if (!isGodotLanguage(lang)) continue;
+            const resolved = if (bare)
+                (if (lang == .gdscript) class_target else null)
+            else
+                resolveGodotResPath(self, importer.*, key);
+            const target = resolved orelse continue;
+            if (!std.mem.eql(u8, path, target)) continue;
+            var exists = false;
+            for (results.items) |p| if (std.mem.eql(u8, p, importer.*)) {
+                exists = true;
+                break;
+            };
+            if (!exists) try results.append(allocator, try allocator.dupe(u8, importer.*));
+        }
+    }
     return results.toOwnedSlice(allocator);
 }
 
@@ -229,10 +280,21 @@ pub fn resolveLocalDependency(self: *Explorer, key: []const u8) ?[]const u8 {
 /// Ambiguous names remain unresolved within the selected scope.
 pub fn resolveDependency(self: *Explorer, importer: []const u8, key: []const u8) ?[]const u8 {
     if (resolveLocalDependency(self, key)) |resolved| return resolved;
+    if (std.mem.startsWith(u8, key, godot_parser.ref_prefix)) {
+        return resolveGdReference(self, importer, key[godot_parser.ref_prefix.len..]);
+    }
+    const importer_lang = @import("types.zig").detectLanguage(importer);
+    if (isGodotLanguage(importer_lang)) {
+        if (resolveGodotResPath(self, importer, key)) |resolved| return resolved;
+    }
     if (self.outlines.getKey(key)) |exact| return exact;
     if (key.len == 0 or std.mem.indexOfScalar(u8, key, '/') != null) return null;
 
-    const is_fsharp = @import("types.zig").detectLanguage(importer) == .f_sharp;
+    if (importer_lang == .gdscript) {
+        if (resolveGdClassName(self, key)) |resolved| return resolved;
+    }
+
+    const is_fsharp = importer_lang == .f_sharp;
     const importer_dir = std.fs.path.dirname(importer) orelse "";
     var found: ?[]const u8 = null;
     var found_count: usize = 0;
@@ -256,6 +318,200 @@ pub fn resolveDependency(self: *Explorer, importer: []const u8, key: []const u8)
     return if (found_count == 1) found else null;
 }
 
+fn isGodotLanguage(lang: @import("types.zig").Language) bool {
+    return switch (lang) {
+        .gdscript, .godot_scene, .godot_resource, .godot_project => true,
+        else => false,
+    };
+}
+
+/// Directory prefix ("" for the index root) of the nearest ancestor of
+/// `importer` that holds an indexed project.godot, or null when none exists.
+fn godotProjectDir(self: *Explorer, importer: []const u8) ?[]const u8 {
+    var dir: []const u8 = if (std.mem.lastIndexOfScalar(u8, importer, '/')) |sep| importer[0..sep] else "";
+    while (true) {
+        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        const marker = if (dir.len == 0)
+            "project.godot"
+        else
+            std.fmt.bufPrint(&buf, "{s}/project.godot", .{dir}) catch return null;
+        if (self.outlines.contains(marker)) return dir;
+        if (dir.len == 0) return null;
+        dir = if (std.mem.lastIndexOfScalar(u8, dir, '/')) |sep| dir[0..sep] else "";
+    }
+}
+
+/// Godot res:// paths are relative to the project root, not the importing
+/// file. When the index contains a project below its root (for example a
+/// monorepo with games/foo/project.godot), resolve against that project so
+/// its files win over same-named files elsewhere. Root-level projects use
+/// the exact lookup in resolveDependency.
+fn resolveGodotResPath(self: *Explorer, importer: []const u8, key: []const u8) ?[]const u8 {
+    if (key.len == 0 or key[0] == '/') return null;
+    const root = godotProjectDir(self, importer) orelse return null;
+    if (root.len == 0) return null;
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const candidate = std.fmt.bufPrint(&buf, "{s}/{s}", .{ root, key }) catch return null;
+    return self.outlines.getKey(candidate);
+}
+
+fn declaresClassName(outline: *const FileOutline, line_start: u32) bool {
+    for (outline.symbols.items) |sym| {
+        if (sym.line_start != line_start or sym.kind != .class_def) continue;
+        const detail = sym.detail orelse return false;
+        return std.mem.startsWith(u8, detail, "class_name ");
+    }
+    return false;
+}
+
+/// GDScript `class_name Foo` is a global name: `extends Foo` and type hints
+/// name a class, not a file, and the file is often snake_case (class
+/// ClayModel in clay_model.gd). A bare name resolves to the one indexed
+/// GDScript file that declares that top-level class_name. Ambiguous or
+/// unknown names stay unresolved.
+fn resolveGdClassName(self: *Explorer, name: []const u8) ?[]const u8 {
+    const locations = self.symbol_index.get(name) orelse return null;
+    var found: ?[]const u8 = null;
+    for (locations.items) |loc| {
+        const outline = self.outlines.getPtr(loc.path) orelse continue;
+        if (outline.language != .gdscript) continue;
+        if (!declaresClassName(outline, loc.line_start)) continue;
+        if (found != null) return null;
+        found = self.outlines.getKey(loc.path);
+    }
+    return found;
+}
+
+/// A reference resolves to a class_name declaration first, then to a project
+/// autoload. A file never references itself (a class calling its own
+/// `ClayBlob.new()`).
+fn resolveGdReference(self: *Explorer, importer: []const u8, name: []const u8) ?[]const u8 {
+    const target = resolveGdClassName(self, name) orelse resolveGdAutoload(self, importer, name) orelse return null;
+    return if (std.mem.eql(u8, target, importer)) null else target;
+}
+
+/// The script that autoload `name` points at, for `importer`. Autoload entries
+/// are symbols (see lifecycle), so the symbol index finds each project file.
+/// When several projects declare the name (a monorepo), the project holding the
+/// importer wins, nearest first. With no project holding it, a single
+/// declaration still resolves; anything else stays unresolved.
+fn resolveGdAutoload(self: *Explorer, importer: []const u8, name: []const u8) ?[]const u8 {
+    const locations = self.symbol_index.get(name) orelse return null;
+    var nearest: ?AutoloadTarget = null;
+    var first: ?[]const u8 = null;
+    var distinct = false;
+    for (locations.items) |loc| {
+        const hit = autoloadTarget(self, loc, name) orelse continue;
+        if (first) |f| {
+            if (!std.mem.eql(u8, f, hit.target)) distinct = true;
+        } else first = hit.target;
+        if (!projectHolds(hit.dir, importer)) continue;
+        if (nearest) |n| {
+            if (hit.dir.len > n.dir.len) {
+                nearest = hit;
+            } else if (hit.dir.len == n.dir.len and !std.mem.eql(u8, n.target, hit.target)) {
+                return null;
+            }
+        } else nearest = hit;
+    }
+    if (nearest) |n| return n.target;
+    return if (distinct) null else first;
+}
+
+const AutoloadTarget = struct { dir: []const u8, target: []const u8 };
+
+/// The script of the autoload entry at `loc`, with its project directory.
+fn autoloadTarget(self: *Explorer, loc: SymbolLocation, name: []const u8) ?AutoloadTarget {
+    const project = self.outlines.getPtr(loc.path) orelse return null;
+    if (project.language != .godot_project) return null;
+    const script = autoloadScriptAt(project, name, loc.line_start) orelse return null;
+    // The script path is project-relative: it resolves against the directory
+    // that holds this project.godot.
+    const dir = projectDirOf(loc.path);
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const candidate = if (dir.len == 0)
+        script
+    else
+        std.fmt.bufPrint(&buf, "{s}/{s}", .{ dir, script }) catch return null;
+    const target = self.outlines.getKey(candidate) orelse return null;
+    return .{ .dir = dir, .target = target };
+}
+
+fn projectDirOf(path: []const u8) []const u8 {
+    return if (std.mem.lastIndexOfScalar(u8, path, '/')) |sep| path[0..sep] else "";
+}
+
+/// True when `importer` lies inside project directory `dir` ("" is the index root).
+fn projectHolds(dir: []const u8, importer: []const u8) bool {
+    if (dir.len == 0) return true;
+    return importer.len > dir.len and std.mem.startsWith(u8, importer, dir) and importer[dir.len] == '/';
+}
+
+fn autoloadScriptAt(project: *const FileOutline, name: []const u8, line: u32) ?[]const u8 {
+    for (project.symbols.items) |sym| {
+        if (sym.line_start != line or sym.kind != .variable) continue;
+        if (!std.mem.eql(u8, sym.name, name)) continue;
+        const detail = sym.detail orelse return null;
+        return godot_parser.autoloadResPath(detail);
+    }
+    return null;
+}
+
+/// Display form of a forward-dependency key: the resolved path, or the key for
+/// ordinary imports. An unresolved Godot reference is internal bookkeeping,
+/// so it returns null and is not shown.
+pub fn displayDependency(self: *Explorer, importer: []const u8, key: []const u8) ?[]const u8 {
+    if (resolveDependency(self, importer, key)) |resolved| return resolved;
+    if (std.mem.startsWith(u8, key, godot_parser.ref_prefix)) return null;
+    return key;
+}
+
+/// Record GDScript references as `ref:Name` keys: type annotations on this
+/// file's declarations, and capitalized `Name.member` receivers in its code.
+fn collectGdReferenceDeps(
+    self: *Explorer,
+    path: []const u8,
+    outline: *const FileOutline,
+    seen: *std.StringHashMap(void),
+    deps: *std.ArrayList([]const u8),
+    arena: std.mem.Allocator,
+) !void {
+    var annotations: [godot_parser.max_annotations][]const u8 = undefined;
+    for (outline.symbols.items) |sym| {
+        if (sym.kind == .import) continue;
+        const detail = sym.detail orelse continue;
+        const count = godot_parser.typeAnnotations(detail, &annotations);
+        for (annotations[0..count]) |text| {
+            var pos: usize = 0;
+            while (godot_parser.nextTypeName(text, &pos)) |name| {
+                try addGdReference(self, name, seen, deps, arena);
+            }
+        }
+    }
+    // Receivers come from source code, which needs cached content. Without
+    // it only annotations are recorded.
+    const content = self.contents.get(path) orelse return;
+    const masked = try @import("../source_lexical.zig").mask(arena, content, .gdscript);
+    var pos: usize = 0;
+    while (godot_parser.nextReceiver(masked, &pos)) |name| {
+        try addGdReference(self, name, seen, deps, arena);
+    }
+}
+
+fn addGdReference(
+    self: *Explorer,
+    name: []const u8,
+    seen: *std.StringHashMap(void),
+    deps: *std.ArrayList([]const u8),
+    arena: std.mem.Allocator,
+) !void {
+    if (name.len == 0 or godot_parser.isBuiltinGdType(name)) return;
+    const key = try std.fmt.allocPrint(arena, "{s}{s}", .{ godot_parser.ref_prefix, name });
+    const gop = try seen.getOrPut(key);
+    if (gop.found_existing) return;
+    try deps.append(self.allocator, key);
+}
+
 // Resolve each hop against the current corpus. Local import keys never
 // become basename guesses, and deletions/ambiguity stop traversal.
 fn transitiveResolved(self: *Explorer, path: []const u8, allocator: std.mem.Allocator, depth_limit: ?u32, forward: bool) ![]const []const u8 {
@@ -275,7 +531,12 @@ fn transitiveResolved(self: *Explorer, path: []const u8, allocator: std.mem.Allo
         if (node.depth >= (depth_limit orelse 128)) continue;
         const edges = if (forward) self.dep_graph.getForwardDeps(node.path) orelse &.{} else try getImportedByLocked(self, node.path, a);
         for (edges) |edge| {
-            const resolved = if (forward) resolveDependency(self, node.path, edge) orelse edge else edge;
+            const resolved = if (forward) blk: {
+                if (resolveDependency(self, node.path, edge)) |r| break :blk r;
+                // Unresolved Godot references are internal keys, not files.
+                if (std.mem.startsWith(u8, edge, godot_parser.ref_prefix)) continue;
+                break :blk edge;
+            } else edge;
             if (seen.contains(resolved)) continue;
             try seen.put(resolved, {});
             try result.append(allocator, try allocator.dupe(u8, resolved));
@@ -384,6 +645,9 @@ pub fn rebuildDepsFor(self: *Explorer, path: []const u8, outline: *FileOutline) 
     }
 
     try collectTypeUsageDeps(self, path, outline, &seen, &deps);
+    if (outline.language == .gdscript) {
+        try collectGdReferenceDeps(self, path, outline, &seen, &deps, temporary.allocator());
+    }
 
     try self.dep_graph.setDeps(path, deps);
 }

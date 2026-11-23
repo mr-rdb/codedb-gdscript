@@ -81,10 +81,11 @@ fn parseGdDecl(line: []const u8, indent: usize, state: *GdState) ParsedLine {
     }
     if (std.mem.startsWith(u8, line, "extends ")) {
         const target = std.mem.trim(u8, line["extends ".len..], " \t");
-        if (target.len >= 2 and target[0] == '"') {
-            // extends "res://base.gd"
+        if (target.len >= 2 and (target[0] == '"' or target[0] == '\'')) {
+            // extends "res://base.gd" (GDScript accepts either quote style)
+            const quote = target[0];
             const inner = target[1..];
-            const end = std.mem.indexOfScalar(u8, inner, '"') orelse return .none;
+            const end = std.mem.indexOfScalar(u8, inner, quote) orelse return .none;
             return .{ .import = .{ .path = stripResPrefix(inner[0..end]) } };
         }
         const name = extractIdent(target) orelse return .none;
@@ -127,16 +128,29 @@ fn parseGdDecl(line: []const u8, indent: usize, state: *GdState) ParsedLine {
 /// Find a preload("res://...") or load("res://...") reference on a line.
 /// Returns the project-relative path (res:// stripped), or null. Only
 /// res:// paths count — user:// and absolute paths are runtime-only.
+/// Both quote styles are accepted, and `my_load(` / `foo.preload(` style
+/// identifiers are not mistaken for the Godot calls.
 pub fn extractResPath(line: []const u8) ?[]const u8 {
-    const keywords = [_][]const u8{ "preload(\"", "load(\"" };
-    for (keywords) |kw| {
-        const pos = std.mem.indexOf(u8, line, kw) orelse continue;
-        const rest = line[pos + kw.len ..];
-        const end = std.mem.indexOfScalar(u8, rest, '"') orelse continue;
-        const path = rest[0..end];
-        if (std.mem.startsWith(u8, path, "res://")) return path["res://".len..];
+    const needles = [_][]const u8{ "preload(\"", "preload('", "load(\"", "load('" };
+    for (needles) |needle| {
+        const quote = needle[needle.len - 1];
+        var from: usize = 0;
+        while (std.mem.indexOfPos(u8, line, from, needle)) |pos| {
+            from = pos + 1;
+            // "load(" also matches inside "preload(" (handled by its own
+            // needle), and identifiers such as "my_load(" are not calls.
+            if (pos > 0 and isIdentChar(line[pos - 1])) continue;
+            const rest = line[pos + needle.len ..];
+            const end = std.mem.indexOfScalar(u8, rest, quote) orelse break;
+            const path = rest[0..end];
+            if (std.mem.startsWith(u8, path, "res://")) return path["res://".len..];
+        }
     }
     return null;
+}
+
+fn isIdentChar(ch: u8) bool {
+    return std.ascii.isAlphanumeric(ch) or ch == '_';
 }
 
 /// Strip a trailing `#` comment, respecting single/double-quoted strings.
@@ -279,12 +293,8 @@ pub fn parseProjectLine(trimmed: []const u8, section: *ProjectSection) ParsedLin
     switch (section.*) {
         .autoload => {
             // GameState="*res://GameState.gd" — the '*' marks an autoload node
-            const eq = std.mem.indexOfScalar(u8, trimmed, '=') orelse return .none;
-            const value = std.mem.trim(u8, trimmed[eq + 1 ..], " \t");
-            if (value.len < 2 or value[0] != '"') return .none;
-            const inner = value[1..];
-            const close = std.mem.indexOfScalar(u8, inner, '"') orelse return .none;
-            return .{ .import = .{ .path = stripResPrefix(inner[0..close]) } };
+            const path = autoloadResPath(trimmed) orelse return .none;
+            return .{ .import = .{ .path = path } };
         },
         .input => {
             // place_tower={ "deadzone": 0.5, ... } — only the key line matters
@@ -359,4 +369,249 @@ fn extractQuotedAttr(line: []const u8, attr: []const u8) ?[]const u8 {
         }
     }
     return null; // unterminated value
+}
+
+// ── GDScript references, autoloads, and scene wiring ───────────────────────
+// Reference dependency keys carry `ref_prefix`. deps.zig resolves them at
+// query time against class_name declarations and project.godot autoloads, so
+// a key stays only a name until a question asks what it refers to.
+
+pub const ref_prefix = "ref:";
+
+/// Maximum type-annotation texts reported for one declaration line.
+pub const max_annotations = 32;
+
+/// Built-in types and engine singletons. They never name a project file, so
+/// references to them are not recorded.
+pub fn isBuiltinGdType(name: []const u8) bool {
+    const names = [_][]const u8{
+        "void",         "bool",          "int",               "float",          "String",
+        "StringName",   "NodePath",      "Variant",           "Vector2",        "Vector2i",
+        "Vector3",      "Vector3i",      "Vector4",           "Vector4i",       "Rect2",
+        "Rect2i",       "Transform2D",   "Transform3D",       "Plane",          "Quaternion",
+        "AABB",         "Basis",         "Projection",        "Color",          "RID",
+        "Object",       "Callable",      "Signal",            "Dictionary",     "Array",
+        "PackedByteArray", "PackedInt32Array", "PackedInt64Array", "PackedFloat32Array",
+        "PackedFloat64Array", "PackedStringArray", "PackedVector2Array", "PackedVector3Array",
+        "PackedColorArray", "Input",     "Engine",            "OS",             "Time",
+        "Math",
+    };
+    for (names) |n| {
+        if (std.mem.eql(u8, n, name)) return true;
+    }
+    return false;
+}
+
+/// Type-annotation texts of a declaration line (`var x: T`, `const X: T`,
+/// `func f(a: A, b: B) -> R`, `signal s(a: A)`), as slices of `detail`.
+/// Declarations are cut at their initializer, so a dictionary literal's
+/// colons are not read as types; `:=` infers and is not an annotation.
+pub fn typeAnnotations(detail: []const u8, out: *[max_annotations][]const u8) usize {
+    var n: usize = 0;
+    var text = detail;
+    if (std.mem.indexOf(u8, detail, "func ") == null) {
+        if (std.mem.indexOfScalar(u8, detail, '=')) |eq| {
+            text = detail[0 .. if (eq > 0 and detail[eq - 1] == ':') eq - 1 else eq];
+        }
+    }
+    if (std.mem.indexOf(u8, text, "->")) |arrow| {
+        const ret = std.mem.trim(u8, text[arrow + 2 ..], " \t:");
+        if (ret.len > 0) {
+            out[n] = ret;
+            n += 1;
+        }
+        text = text[0..arrow];
+    }
+    var i: usize = 0;
+    while (i < text.len) : (i += 1) {
+        if (text[i] != ':' or (i + 1 < text.len and text[i + 1] == '=')) continue;
+        const start = i + 1;
+        var j = start;
+        var depth: usize = 0; // commas inside Array[A, B] do not end the type
+        while (j < text.len) : (j += 1) {
+            const c = text[j];
+            if (c == '[') {
+                depth += 1;
+            } else if (c == ']') {
+                if (depth > 0) depth -= 1;
+            } else if (depth == 0 and (c == ',' or c == ')' or c == '=' or c == ':')) {
+                break;
+            }
+        }
+        const t = std.mem.trim(u8, text[start..j], " \t");
+        if (t.len > 0 and n < max_annotations) {
+            out[n] = t;
+            n += 1;
+        }
+        i = j;
+    }
+    return n;
+}
+
+/// Iterates the type names in a type text: `Array[ClayBlob]` yields Array and
+/// ClayBlob; a qualifier such as `Outer` in `Outer.Inner` is skipped.
+pub fn nextTypeName(text: []const u8, pos: *usize) ?[]const u8 {
+    var i = pos.*;
+    while (i < text.len) {
+        if (!isIdentStart(text[i])) {
+            i += 1;
+            continue;
+        }
+        const start = i;
+        while (i < text.len and isIdentChar(text[i])) i += 1;
+        pos.* = i;
+        if (i < text.len and text[i] == '.') continue;
+        return text[start..i];
+    }
+    pos.* = i;
+    return null;
+}
+
+/// Iterates `Name.member` receivers in masked source (comments and strings
+/// already blanked). Only capitalized names count: Godot class and autoload
+/// names follow that convention, while lowercase names are locals.
+pub fn nextReceiver(masked: []const u8, pos: *usize) ?[]const u8 {
+    var i = pos.*;
+    while (i < masked.len) {
+        if (!isIdentStart(masked[i])) {
+            i += 1;
+            continue;
+        }
+        const start = i;
+        while (i < masked.len and isIdentChar(masked[i])) i += 1;
+        const bounded = start == 0 or (!isIdentChar(masked[start - 1]) and masked[start - 1] != '.');
+        const member = i + 1 < masked.len and masked[i] == '.' and isIdentStart(masked[i + 1]);
+        if (bounded and member and std.ascii.isUpper(masked[start])) {
+            pos.* = i;
+            return masked[start..i];
+        }
+    }
+    pos.* = i;
+    return null;
+}
+
+/// `Name="*res://path.gd"` in [autoload] → the singleton name.
+pub fn autoloadName(line: []const u8) ?[]const u8 {
+    const eq = std.mem.indexOfScalar(u8, line, '=') orelse return null;
+    const name = std.mem.trim(u8, line[0..eq], " \t");
+    const ident = extractIdent(name) orelse return null;
+    return if (ident.len == name.len) ident else null;
+}
+
+/// Project-relative script path of an [autoload] entry ('*' and res:// stripped).
+pub fn autoloadResPath(line: []const u8) ?[]const u8 {
+    const eq = std.mem.indexOfScalar(u8, line, '=') orelse return null;
+    const value = std.mem.trim(u8, line[eq + 1 ..], " \t");
+    if (value.len < 2 or value[0] != '"') return null;
+    const inner = value[1..];
+    const close = std.mem.indexOfScalar(u8, inner, '"') orelse return null;
+    return stripResPrefix(inner[0..close]);
+}
+
+/// Quoted attribute value of a scene header (`name="..."`), or null.
+pub fn quotedAttr(line: []const u8, name: []const u8) ?[]const u8 {
+    return extractQuotedAttr(line, name);
+}
+
+/// `script = ExtResource("1_abc")` property line → the ext_resource id.
+pub fn nodeScriptId(line: []const u8) ?[]const u8 {
+    if (!std.mem.startsWith(u8, line, "script")) return null;
+    const rest = std.mem.trimStart(u8, line["script".len..], " \t");
+    if (rest.len == 0 or rest[0] != '=') return null;
+    const ext = std.mem.indexOf(u8, rest, "ExtResource(") orelse return null;
+    const after = rest[ext + "ExtResource(".len ..];
+    const open = std.mem.indexOfScalar(u8, after, '"') orelse return null;
+    const id = after[open + 1 ..];
+    const close = std.mem.indexOfScalar(u8, id, '"') orelse return null;
+    return id[0..close];
+}
+
+/// Scene-tree path of a [node] header relative to the scene root ("." for the
+/// root, which has no parent attribute). Children of the root are "name".
+pub fn nodePath(alloc: std.mem.Allocator, parent: ?[]const u8, name: []const u8) ![]const u8 {
+    const p = parent orelse return ".";
+    if (std.mem.eql(u8, p, ".")) return name;
+    return std.fmt.allocPrint(alloc, "{s}/{s}", .{ p, name });
+}
+
+/// Per-scene wiring state. Godot writes ext_resource headers first, nodes
+/// next, and [connection] lines last, so one streaming pass has every target
+/// node before the connection that names it. Connections written out of that
+/// order simply stay unlinked.
+pub const SceneWiring = struct {
+    alloc: std.mem.Allocator,
+    ext_paths: std.StringHashMap([]const u8), // ext id -> project-relative script path
+    node_scripts: std.StringHashMap([]const u8), // node path -> ext id
+    current_node: ?[]const u8 = null, // node whose property lines follow its header
+
+    pub fn init(alloc: std.mem.Allocator) SceneWiring {
+        return .{
+            .alloc = alloc,
+            .ext_paths = std.StringHashMap([]const u8).init(alloc),
+            .node_scripts = std.StringHashMap([]const u8).init(alloc),
+        };
+    }
+
+    /// Feed one trimmed line in file order.
+    pub fn observe(self: *SceneWiring, trimmed: []const u8) !void {
+        if (trimmed.len == 0) return;
+        if (trimmed[0] != '[') {
+            if (self.current_node) |node| {
+                if (nodeScriptId(trimmed)) |id| try self.node_scripts.put(node, id);
+            }
+            return;
+        }
+        self.current_node = null;
+        if (std.mem.startsWith(u8, trimmed, "[ext_resource")) {
+            const id = quotedAttr(trimmed, "id") orelse return;
+            const path = quotedAttr(trimmed, "path") orelse return;
+            try self.ext_paths.put(id, stripResPrefix(path));
+        } else if (std.mem.startsWith(u8, trimmed, "[node ")) {
+            const name = quotedAttr(trimmed, "name") orelse return;
+            self.current_node = try nodePath(self.alloc, quotedAttr(trimmed, "parent"), name);
+        }
+    }
+
+    /// Script path used by the node at `node_path`, or null.
+    pub fn scriptForNode(self: *const SceneWiring, node_path: []const u8) ?[]const u8 {
+        const id = self.node_scripts.get(node_path) orelse return null;
+        return self.ext_paths.get(id);
+    }
+
+    /// Detail for a [connection] symbol: from/to/method, plus `script=` when the
+    /// target node has a script. Built into `buf`; the result is a slice of it.
+    pub fn connectionDetail(self: *const SceneWiring, trimmed: []const u8, buf: []u8) []const u8 {
+        var base_buf: [256]u8 = undefined;
+        const base = extractDetail(trimmed, .connection, &base_buf);
+        const to = quotedAttr(trimmed, "to") orelse "";
+        const out = if (self.scriptForNode(to)) |script|
+            std.fmt.bufPrint(buf, "{s} script={s}", .{ base, script })
+        else
+            std.fmt.bufPrint(buf, "{s}", .{base});
+        return out catch buf[0..0];
+    }
+};
+
+/// Scope label for a scene connection line, e.g. `pressed -> _on_pressed (scripts/x.gd)`.
+/// Null when the detail carries no method (not a connection symbol).
+pub fn connectionLabel(signal: []const u8, detail: []const u8, buf: []u8) ?[]const u8 {
+    const method = detailValue(detail, "method=") orelse return null;
+    if (method.len == 0) return null;
+    const out = if (detailValue(detail, "script=")) |script|
+        std.fmt.bufPrint(buf, "{s} -> {s} ({s})", .{ signal, method, script })
+    else
+        std.fmt.bufPrint(buf, "{s} -> {s}", .{ signal, method });
+    return out catch null;
+}
+
+fn detailValue(detail: []const u8, key: []const u8) ?[]const u8 {
+    var it = std.mem.tokenizeScalar(u8, detail, ' ');
+    while (it.next()) |tok| {
+        if (std.mem.startsWith(u8, tok, key)) return tok[key.len..];
+    }
+    return null;
+}
+
+fn isIdentStart(ch: u8) bool {
+    return std.ascii.isAlphabetic(ch) or ch == '_';
 }

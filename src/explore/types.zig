@@ -191,7 +191,9 @@ pub fn detectLanguage(path: []const u8) Language {
     if (std.mem.endsWith(u8, path, ".gd")) return .gdscript;
     if (std.mem.endsWith(u8, path, ".tscn")) return .godot_scene;
     if (std.mem.endsWith(u8, path, ".tres")) return .godot_resource;
-    if (std.mem.endsWith(u8, path, "project.godot")) return .godot_project;
+    // Exact basename: "myproject.godot" is not a Godot project file.
+    const base = if (std.mem.lastIndexOfScalar(u8, path, '/')) |sep| path[sep + 1 ..] else path;
+    if (std.mem.eql(u8, base, "project.godot")) return .godot_project;
     if (endsWithIgnoreCase(path, ".bim")) return .ssas_tabular;
     if (endsWithIgnoreCase(path, ".tmdl")) return .tmdl;
     if (endsWithIgnoreCase(path, ".dax")) return .dax;

@@ -123,6 +123,7 @@ pub const skip_dirs = [_][]const u8{
     "bower_components",
     ".godot", // godot 4 editor cache (imported assets, shader cache)
     ".import", // godot 3 import cache dir
+    ".mono", // godot .NET generated build/metadata cache
 };
 
 pub fn eqlAsciiIgnoreCase(a: []const u8, b: []const u8) bool {

@@ -19,7 +19,7 @@ pub fn mask(alloc: std.mem.Allocator, source: []const u8, lang: Language) ![]u8 
             }
         } else if (std.mem.startsWith(u8, source[i..], "//") or
             ((lang == .sql or lang == .mdx or lang == .dax) and std.mem.startsWith(u8, source[i..], "--")) or
-            ((lang == .python or lang == .ruby or lang == .shell) and source[i] == '#')) {
+            ((lang == .python or lang == .ruby or lang == .shell or lang == .gdscript) and source[i] == '#')) {
             while (i < source.len and source[i] != '\n') : (i += 1) {}
         } else if (source[i] == '"' or source[i] == '\'' or source[i] == '`') {
             // F# type parameters ('T) are identifiers, not string literals.

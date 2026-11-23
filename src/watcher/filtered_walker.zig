@@ -42,6 +42,7 @@ pub const FilteredWalker = struct {
             defer allocator.free(probe);
             const parent = project_file.openParent(io, root, probe) catch return false;
             defer parent.close(io);
+            if (hasGodotIgnore(io, parent.dir)) return false;
             const base = std.fmt.allocPrint(allocator, "project/{s}", .{path[0..slash]}) catch return false;
             defer allocator.free(base);
             walker.loadRules(parent.dir, ".gitignore", base);
@@ -102,6 +103,19 @@ pub const FilteredWalker = struct {
         if (self.real_root.len > 0) self.allocator.free(self.real_root);
     }
 
+    /// Godot ignores any directory that contains a `.gdignore` file (its
+    /// contents do not matter), so that directory and everything below it stay
+    /// out of the index. Probed like `.gitignore`: one lookup per directory.
+    fn hasGodotIgnore(io: std.Io, dir: std.Io.Dir) bool {
+        const file = dir.openFile(io, ".gdignore", .{
+            .allow_directory = false,
+            .follow_symlinks = false,
+            .resolve_beneath = true,
+        }) catch return false;
+        file.close(io);
+        return true;
+    }
+
     fn loadRules(self: *FilteredWalker, dir: std.Io.Dir, name: []const u8, base: []const u8) void {
         const a = self.arena.allocator();
         const content = project_file.readAlloc(self.io, dir, name, a, .limited(64 * 1024)) catch return;
@@ -138,6 +152,10 @@ pub const FilteredWalker = struct {
                         if (self.isIgnored(check_path, true)) continue;
                     }
                     const sub = top.dir_handle.openDir(self.io, entry.name, .{ .iterate = true, .follow_symlinks = false }) catch continue;
+                    if (hasGodotIgnore(self.io, sub)) {
+                        sub.close(self.io);
+                        continue;
+                    }
                     errdefer sub.close(self.io);
                     const saved_len = self.name_buffer.items.len;
                     errdefer self.name_buffer.shrinkRetainingCapacity(saved_len);
