@@ -997,6 +997,31 @@ pub fn buildTypeGraphForFile(self: *Explorer, path: []const u8, outline: *const 
         const detail = sym.detail orelse continue;
         extractAndRecordBases(&self.type_graph, sym.name, detail) catch {};
     }
+    if (outline.language == .gdscript) recordGdscriptBase(&self.type_graph, outline) catch {};
+}
+
+/// GDScript names its class with `class_name` and takes its base from a
+/// top-level `extends Base` line, which is usually on the line after
+/// `class_name`. Record that base against the class_name. Quoted
+/// `extends "res://..."` bases name a file, not a class, so they are skipped.
+fn recordGdscriptBase(graph: *TypeGraph, outline: *const FileOutline) !void {
+    var class_name: ?[]const u8 = null;
+    var base: ?[]const u8 = null;
+    for (outline.symbols.items) |sym| {
+        const detail = sym.detail orelse continue;
+        if (class_name == null and sym.kind == .class_def and std.mem.startsWith(u8, detail, "class_name ")) {
+            class_name = sym.name;
+        } else if (base == null and sym.kind == .import and std.mem.startsWith(u8, detail, "extends ")) {
+            const target = std.mem.trim(u8, detail["extends ".len..], " \t\r");
+            if (target.len == 0 or target[0] == '"' or target[0] == '\'') continue;
+            var end: usize = 0;
+            while (end < target.len and parse_utils.isIdentChar(target[end])) : (end += 1) {}
+            if (end > 0) base = target[0..end];
+        }
+    }
+    if (class_name) |name| {
+        if (base) |b| try graph.addRelationship(name, b);
+    }
 }
 
 /// Extract base type names from a declaration detail line and record in TypeGraph.

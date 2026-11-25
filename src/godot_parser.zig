@@ -39,6 +39,10 @@ pub const ParsedLine = union(enum) {
 pub const GdState = struct {
     in_multiline_string: bool = false,
     inner_class_indent: ?usize = null,
+    /// Indent of the `func` whose body the cursor is inside, or null at class
+    /// scope. Any `var`/`const` deeper than this is a function local, not a
+    /// symbol of the script.
+    func_indent: ?usize = null,
 };
 
 /// project.godot section tracking.
@@ -46,7 +50,9 @@ pub const ProjectSection = enum { none, autoload, input, other };
 
 // ── GDScript ───────────────────────────────────────────────────────────────
 
-pub fn parseGdLine(raw_line: []const u8, trimmed: []const u8, state: *GdState) ParsedLine {
+pub fn parseGdLine(raw_line: []const u8, trimmed_in: []const u8, state: *GdState) ParsedLine {
+    // CRLF-safe: a bare "\r" is an empty line, not a column-0 statement.
+    const trimmed = std.mem.trim(u8, trimmed_in, " \t\r");
     if (trimmed.len == 0) return .none;
 
     // Multiline ("""/''') string tracking: an odd number of markers on a
@@ -61,9 +67,16 @@ pub fn parseGdLine(raw_line: []const u8, trimmed: []const u8, state: *GdState) P
     if (countTripleQuotes(line) % 2 == 1) state.in_multiline_string = true;
 
     const indent = leadingIndent(raw_line);
+    // Only a real declaration (identifier or annotation at column <= the
+    // scope's indent) leaves a scope. A bare ")" or "]" closing a multi-line
+    // signature is a continuation, not the end of the function.
+    const ends_scope = isIdentStart(line[0]) or line[0] == '@';
     // Any declaration at or below the inner class's own indent leaves its scope.
     if (state.inner_class_indent) |ci| {
-        if (indent <= ci) state.inner_class_indent = null;
+        if (ends_scope and indent <= ci) state.inner_class_indent = null;
+    }
+    if (state.func_indent) |fi| {
+        if (ends_scope and indent <= fi) state.func_indent = null;
     }
 
     if (line[0] == '@') {
@@ -104,17 +117,22 @@ fn parseGdDecl(line: []const u8, indent: usize, state: *GdState) ParsedLine {
             (if (indent > ci) .method_def else .function_def)
         else
             .function_def;
+        state.func_indent = indent;
         return .{ .symbol = .{ .name = name, .kind = kind } };
     }
     if (std.mem.startsWith(u8, rest, "signal ")) {
         const name = extractIdent(rest["signal ".len..]) orelse return .none;
         return .{ .symbol = .{ .name = name, .kind = .signal_decl } };
     }
+    // Function-local `var`/`const` are not script symbols: they would
+    // otherwise flood the outline and claim scope for call sites.
     if (std.mem.startsWith(u8, rest, "var ")) {
+        if (state.func_indent != null) return .none;
         const name = extractIdent(rest["var ".len..]) orelse return .none;
         return .{ .symbol = .{ .name = name, .kind = .variable_decl } };
     }
     if (std.mem.startsWith(u8, rest, "const ")) {
+        if (state.func_indent != null) return .none;
         const name = extractIdent(rest["const ".len..]) orelse return .none;
         return .{ .symbol = .{ .name = name, .kind = .constant_decl } };
     }
@@ -614,4 +632,114 @@ fn detailValue(detail: []const u8, key: []const u8) ?[]const u8 {
 
 fn isIdentStart(ch: u8) bool {
     return std.ascii.isAlphabetic(ch) or ch == '_';
+}
+
+// ── Godot shading language (.gdshader, .gdshaderinc) ───────────────────────
+
+/// Per-file state for the shading language. A `/* */` comment can span lines,
+/// and brace depth separates top-level declarations from function bodies.
+pub const GdshaderState = struct {
+    in_block_comment: bool = false,
+    depth: usize = 0,
+};
+
+/// Parse one line of a .gdshader file: top-level uniforms, varyings, consts,
+/// structs, shader functions and `#include` paths. Lines inside a function body
+/// yield nothing, so locals do not reach the outline. Known limit: code after a
+/// `/* */` comment that closes on the same line is dropped with the comment.
+pub fn parseGdshaderLine(trimmed_in: []const u8, state: *GdshaderState) ParsedLine {
+    const trimmed = std.mem.trim(u8, trimmed_in, " \t\r");
+    const at_top = state.depth == 0;
+    const code = shaderCode(trimmed, state);
+    defer countShaderBraces(code, state);
+    if (!at_top or code.len == 0) return .none;
+
+    if (std.mem.startsWith(u8, code, "#include")) {
+        const q1 = std.mem.indexOfScalar(u8, code, '"') orelse return .none;
+        const rest = code[q1 + 1 ..];
+        const q2 = std.mem.indexOfScalar(u8, rest, '"') orelse return .none;
+        const path = stripResPrefix(rest[0..q2]);
+        if (path.len == 0) return .none;
+        return .{ .import = .{ .path = path } };
+    }
+
+    var pos: usize = 0;
+    var first = nextShaderWord(code, &pos) orelse return .none;
+    while (std.mem.eql(u8, first, "global") or std.mem.eql(u8, first, "instance")) {
+        first = nextShaderWord(code, &pos) orelse return .none;
+    }
+    if (std.mem.eql(u8, first, "uniform") or std.mem.eql(u8, first, "varying") or std.mem.eql(u8, first, "const")) {
+        const kind: Kind = if (std.mem.eql(u8, first, "const")) .constant_decl else .variable_decl;
+        _ = nextShaderWord(code, &pos) orelse return .none; // type
+        const name = nextShaderWord(code, &pos) orelse return .none;
+        return .{ .symbol = .{ .name = name, .kind = kind } };
+    }
+    if (std.mem.eql(u8, first, "struct")) {
+        const name = nextShaderWord(code, &pos) orelse return .none;
+        return .{ .symbol = .{ .name = name, .kind = .inner_class } };
+    }
+    // Shader function: `<return type> <name>(`. Anything else (shader_type,
+    // render_mode, a stray statement) is not a declaration.
+    const name = nextShaderWord(code, &pos) orelse return .none;
+    const rest = std.mem.trimStart(u8, code[pos..], " \t");
+    if (rest.len == 0 or rest[0] != '(') return .none;
+    return .{ .symbol = .{ .name = name, .kind = .function_def } };
+}
+
+/// The code part of a shading-language line with `//` and `/* */` comments
+/// removed. Updates `in_block_comment` when a block comment stays open.
+fn shaderCode(line: []const u8, state: *GdshaderState) []const u8 {
+    var i: usize = 0;
+    if (state.in_block_comment) {
+        const close = std.mem.indexOf(u8, line, "*/") orelse return "";
+        state.in_block_comment = false;
+        i = close + 2;
+    }
+    const start = i;
+    var in_string = false;
+    while (i < line.len) : (i += 1) {
+        const c = line[i];
+        // `//` inside a string is part of the path: "res://shaders/x.gdshaderinc".
+        if (in_string) {
+            if (c == '"') in_string = false;
+            continue;
+        }
+        if (c == '"') {
+            in_string = true;
+        } else if (c == '/' and i + 1 < line.len and line[i + 1] == '/') {
+            break;
+        } else if (c == '/' and i + 1 < line.len and line[i + 1] == '*') {
+            if (std.mem.indexOf(u8, line[i + 2 ..], "*/") == null) state.in_block_comment = true;
+            break;
+        }
+    }
+    return std.mem.trim(u8, line[start..i], " \t\r");
+}
+
+/// Adjust brace depth by the braces on a code line. Braces inside a
+/// "string" (an #include path, say) are text, not block structure.
+fn countShaderBraces(code: []const u8, state: *GdshaderState) void {
+    var in_string = false;
+    for (code) |ch| {
+        if (ch == '"') {
+            in_string = !in_string;
+        } else if (in_string) {
+            continue;
+        } else if (ch == '{') {
+            state.depth += 1;
+        } else if (ch == '}' and state.depth > 0) {
+            state.depth -= 1;
+        }
+    }
+}
+
+/// Next identifier token at or after `pos`, advancing `pos` past it.
+fn nextShaderWord(text: []const u8, pos: *usize) ?[]const u8 {
+    var i = pos.*;
+    while (i < text.len and !isIdentStart(text[i])) : (i += 1) {}
+    if (i >= text.len) return null;
+    const start = i;
+    while (i < text.len and isIdentChar(text[i])) : (i += 1) {}
+    pos.* = i;
+    return text[start..i];
 }

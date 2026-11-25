@@ -24,6 +24,7 @@ const parse_utils = @import("parse_utils.zig");
 const skip_rules = @import("../watcher/skip_rules.zig");
 const startsWith = parse_utils.startsWith;
 const appendOutlineSymbol = parse_utils.appendOutlineSymbol;
+const appendOutlineSymbolWithTypes = parse_utils.appendOutlineSymbolWithTypes;
 const appendImportSymbol = parse_utils.appendImportSymbol;
 const extractStringLiteral = parse_utils.extractStringLiteral;
 
@@ -125,6 +126,10 @@ pub fn commitParsedFileOwnedOutline(self: *Explorer, path: []const u8, content: 
             self.sparse_ngram_index.removeFile(stable_path);
             try self.skip_trigram_files.put(stable_path, {});
         }
+    } else if (!self.trigram_index.containsFile(stable_path)) {
+        // Outline-only commit (fast snapshot restore): the file has no trigram
+        // coverage here, so tier 3 of searchContent must reach it.
+        try self.skip_trigram_files.put(stable_path, {});
     }
 
     try self.rebuildDepsFor(stable_path, &persistent_outline);
@@ -479,6 +484,7 @@ pub fn parseOutlineWithParser(parser: *Explorer, path: []const u8, content: []co
     var in_razor_code_block: bool = false;
     var razor_brace_depth: u32 = 0;
     var gd_state: godot_parser.GdState = .{};
+    var gdshader_state: godot_parser.GdshaderState = .{};
     var scene_arena = std.heap.ArenaAllocator.init(parser.allocator);
     defer scene_arena.deinit();
     var scene_wiring = godot_parser.SceneWiring.init(scene_arena.allocator());
@@ -491,7 +497,11 @@ pub fn parseOutlineWithParser(parser: *Explorer, path: []const u8, content: []co
     var lines = std.mem.splitScalar(u8, content, '\n');
     while (lines.next()) |line| {
         line_num += 1;
-        var trimmed = std.mem.trim(u8, line, " \t");
+        // CRLF files leave a trailing '\r' on every line. Treat it as
+        // whitespace here so blank lines are really empty: a stray "\r"
+        // line reads as a column-0 statement and ends indent-scoped state
+        // (GDScript inner classes) early. Affects every language.
+        var trimmed = std.mem.trim(u8, line, " \t\r");
 
         if (outline.language == .f_sharp) {
             if (fsharp_comment_depth != 0) {
@@ -930,18 +940,46 @@ pub fn parseOutlineWithParser(parser: *Explorer, path: []const u8, content: []co
                         .class_name_decl, .inner_class => .class_def,
                         .function_def => .function,
                         .method_def => .method,
-                        .signal_decl => .constant,
+                        .signal_decl => .signal,
                         .variable_decl => .variable,
                         .constant_decl => .constant,
                         .enum_decl => .enum_def,
                         else => unreachable, // scene/project kinds never come from parseGdLine
                     };
                     const before_count = outline.symbols.items.len;
-                    try appendOutlineSymbol(parser.allocator, &outline, sym.name, sk, line_num, trimmed);
+                    if (sym.kind == .function_def or sym.kind == .method_def) {
+                        // `-> R` and `a: A` annotations feed codedb_types. The
+                        // helper lists the return type first when `->` is present.
+                        var annotations: [godot_parser.max_annotations][]const u8 = undefined;
+                        const n = godot_parser.typeAnnotations(trimmed, &annotations);
+                        const has_ret = n > 0 and std.mem.indexOf(u8, trimmed, "->") != null;
+                        const ret_type: ?[]const u8 = if (has_ret) annotations[0] else null;
+                        const param_types = if (has_ret) annotations[1..n] else annotations[0..n];
+                        try appendOutlineSymbolWithTypes(parser.allocator, &outline, sym.name, sk, line_num, trimmed, ret_type, param_types);
+                    } else {
+                        try appendOutlineSymbol(parser.allocator, &outline, sym.name, sk, line_num, trimmed);
+                    }
                     if (gd_pending_decorators.items.len > 0) {
                         try attachDecoratorsToSymbols(parser.allocator, &outline, before_count, gd_pending_decorators.items);
                         clearDecoratorList(parser.allocator, &gd_pending_decorators);
                     }
+                },
+                .import => |imp| {
+                    try appendImportSymbol(parser.allocator, &outline, imp.path, line_num, trimmed);
+                },
+            }
+        } else if (outline.language == .gdshader) {
+            switch (godot_parser.parseGdshaderLine(trimmed, &gdshader_state)) {
+                .none, .annotation => {},
+                .symbol => |sym| {
+                    const sk: SymbolKind = switch (sym.kind) {
+                        .inner_class => .struct_def,
+                        .function_def => .function,
+                        .variable_decl => .variable,
+                        .constant_decl => .constant,
+                        else => unreachable, // gdscript-only kinds never come from the shader parser
+                    };
+                    try appendOutlineSymbol(parser.allocator, &outline, sym.name, sk, line_num, trimmed);
                 },
                 .import => |imp| {
                     try appendImportSymbol(parser.allocator, &outline, imp.path, line_num, trimmed);
@@ -1301,13 +1339,19 @@ pub fn indexFileInner(self: *Explorer, path: []const u8, content: []const u8, fu
 }
 /// Rebuild trigram index from the stored file contents.
 /// Used after a cache hit to populate trigrams when they were skipped during the fast scan.
-/// Remove every skip_trigram_files entry the current trigram index
-/// covers. Caller must hold the EXCLUSIVE lock. Snapshot restore parks
-/// every file in the skip set (#507/#537 — it cannot know what a disk
-/// trigram index covers), so without this reconciliation tier 3
-/// content-scans the ENTIRE project on each fall-through query even
-/// though the loaded index already answers for those files. Keys are
-/// borrowed from `outlines`, so removal never frees. (#615)
+/// Re-establish the search coverage invariant after the trigram index changes:
+/// every indexed file is either covered by `trigram_index` or listed in
+/// `skip_trigram_files`, which is what searchContent's tier 3 scans.
+///
+/// Entries the trigram index now covers are dropped (tier 3 would otherwise
+/// content-scan the whole project on each fall-through query, #615). Outline
+/// paths it does not cover are added. Without that second half, files
+/// excluded by the trigram size cap, and files loaded by outline-only restore,
+/// were reachable only through identifier lookups and the zero-result
+/// fallback. Punctuated and multi-word queries then silently missed them.
+///
+/// Keys are borrowed from `outlines`, so neither insert nor removal frees.
+/// Caller must hold the EXCLUSIVE lock.
 fn pruneSkipTrigramLocked(self: *Explorer) void {
     var to_remove: std.ArrayList([]const u8) = .empty;
     defer to_remove.deinit(self.allocator);
@@ -1316,6 +1360,12 @@ fn pruneSkipTrigramLocked(self: *Explorer) void {
         if (self.trigram_index.containsFile(k.*)) to_remove.append(self.allocator, k.*) catch break;
     }
     for (to_remove.items) |k| _ = self.skip_trigram_files.remove(k);
+
+    var outline_it = self.outlines.keyIterator();
+    while (outline_it.next()) |k| {
+        if (self.trigram_index.containsFile(k.*)) continue;
+        self.skip_trigram_files.put(k.*, {}) catch {};
+    }
 }
 
 /// Swap in a trigram index (disk mmap load / post-scan build) and

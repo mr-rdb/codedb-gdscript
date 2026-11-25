@@ -285,7 +285,7 @@ test "e2e: .gd file yields outline symbols and imports" {
 
     try testing.expectEqual(SymbolKind.function, findSymbol(outline, "place_tower").?.kind);
     try testing.expectEqual(SymbolKind.function, findSymbol(outline, "reset").?.kind);
-    try testing.expectEqual(SymbolKind.constant, findSymbol(outline, "tower_placed").?.kind);
+    try testing.expectEqual(SymbolKind.signal, findSymbol(outline, "tower_placed").?.kind);
     try testing.expectEqual(SymbolKind.variable, findSymbol(outline, "default_tower_scene").?.kind);
     try testing.expectEqual(SymbolKind.constant, findSymbol(outline, "TowerScene").?.kind);
 
@@ -839,4 +839,203 @@ test "gdscript: a connection written before its target node stays unlinked" {
     const outline = explorer.outlines.get("Early.tscn").?;
     const pressed = findSymbol(outline, "pressed").?;
     try testing.expectEqualStrings("from=Button to=. method=_on_pressed", pressed.detail.?);
+}
+
+// ── CRLF, function-local declarations, class_name bases, typed signatures ──
+
+test "gdscript: CRLF blank lines keep an inner class scope (method vs function)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var explorer = Explorer.init(arena.allocator());
+
+    // Every line ends in CRLF, as Windows-authored Godot scripts do. The blank
+    // line between two methods used to read as a column-0 statement.
+    try explorer.indexFile("crlf.gd", "class_name Hud\r\nextends Control\r\n\r\n" ++
+        "class Rule extends Control:\r\n" ++
+        "\tfunc _init() -> void:\r\n" ++
+        "\t\tpass\r\n" ++
+        "\r\n" ++
+        "\tfunc _draw() -> void:\r\n" ++
+        "\t\tpass\r\n");
+
+    const outline = explorer.outlines.get("crlf.gd").?;
+    try testing.expectEqual(SymbolKind.method, findSymbol(outline, "_init").?.kind);
+    try testing.expectEqual(SymbolKind.method, findSymbol(outline, "_draw").?.kind);
+    // The detail is the trimmed line: no trailing CR leaks into it.
+    try testing.expectEqualStrings("func _draw() -> void:", findSymbol(outline, "_draw").?.detail.?);
+}
+
+test "gdscript: function-local var and const are not outline symbols" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var explorer = Explorer.init(arena.allocator());
+
+    const src = "class_name Spawner\n" ++
+        "var lane_count: int = 0\n" ++
+        "\n" ++
+        "func spawn(n: int) -> int:\n" ++
+        "\tvar spawned: int = n * 2\n" ++
+        "\tconst LIMIT := 8\n" ++
+        "\tif spawned > LIMIT:\n" ++
+        "\t\tvar clipped: int = LIMIT\n" ++
+        "\t\treturn clipped\n" ++
+        "\treturn spawned\n" ++
+        "\n" ++
+        "var after_func: float = 1.0\n";
+    try explorer.indexFile("locals.gd", src);
+
+    const outline = explorer.outlines.get("locals.gd").?;
+    try testing.expect(findSymbol(outline, "lane_count") != null);
+    try testing.expect(findSymbol(outline, "after_func") != null);
+    try testing.expect(findSymbol(outline, "spawned") == null);
+    try testing.expect(findSymbol(outline, "LIMIT") == null);
+    try testing.expect(findSymbol(outline, "clipped") == null);
+}
+
+test "gdscript: a bare closing paren of a multi-line signature keeps the function scope" {
+    var st: gp.GdState = .{};
+    _ = gp.parseGdLine("func build(", "func build(", &st);
+    _ = gp.parseGdLine("\ta: int,", "a: int,", &st);
+    _ = gp.parseGdLine(")", ")", &st);
+    const r = gp.parseGdLine("\tvar inner: int = 1", "var inner: int = 1", &st);
+    try testing.expectEqual(gp.ParsedLine.none, r);
+}
+
+test "gdscript: top-level extends on the line after class_name becomes the class base" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var explorer = Explorer.init(arena.allocator());
+
+    try explorer.indexFile("Enemy.gd", "class_name ClayEnemy\nextends CharacterBody3D\n");
+    try explorer.indexFile("Boss.gd", "class_name ClayBoss\nextends ClayEnemy\n");
+
+    const enemy_bases = explorer.type_graph.getBases("ClayEnemy");
+    try testing.expectEqual(@as(usize, 1), enemy_bases.len);
+    try testing.expectEqualStrings("CharacterBody3D", enemy_bases[0]);
+
+    const enemy_derived = explorer.type_graph.getDerived("ClayEnemy");
+    try testing.expectEqual(@as(usize, 1), enemy_derived.len);
+    try testing.expectEqualStrings("ClayBoss", enemy_derived[0]);
+}
+
+test "gdscript: typed parameters and return type are recorded on the function symbol" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var explorer = Explorer.init(arena.allocator());
+
+    const src = "extends Node\n" ++
+        "func on_enemy_spawned(enemy: ClayEnemy, wave_id: int = 0) -> ClayEnemy:\n" ++
+        "\treturn enemy\n";
+    try explorer.indexFile("wave.gd", src);
+
+    const outline = explorer.outlines.get("wave.gd").?;
+    const sym = findSymbol(outline, "on_enemy_spawned").?;
+    try testing.expectEqualStrings("ClayEnemy", sym.return_type.?);
+    try testing.expectEqual(@as(usize, 2), sym.param_types.len);
+    try testing.expectEqualStrings("ClayEnemy", sym.param_types[0]);
+    try testing.expectEqualStrings("int", sym.param_types[1]);
+
+    const hits = explorer.type_index.findByParamType("ClayEnemy");
+    try testing.expect(hits.len >= 1);
+}
+
+test "shader: top-level declarations and includes are outlined, function locals are not" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var explorer = Explorer.init(arena.allocator());
+
+    const src = "shader_type spatial;\n" ++
+        "render_mode unshaded;\n" ++
+        "#include \"res://shaders/lib.gdshaderinc\"\n" ++
+        "/* block comment\n" ++
+        "uniform float hidden = 0.0;\n" ++
+        "*/\n" ++
+        "uniform float speed = 1.0; // trailing comment\n" ++
+        "uniform sampler2D albedo_tex : source_color;\n" ++
+        "const float SCALE = 2.0;\n" ++
+        "varying vec3 v_pos;\n" ++
+        "void fragment() {\n" ++
+        "\tfloat local_value = speed;\n" ++
+        "\tALBEDO = vec3(local_value);\n" ++
+        "}\n";
+    try explorer.indexFile("clay.gdshader", src);
+
+    const outline = explorer.outlines.get("clay.gdshader").?;
+    try testing.expectEqual(explore.Language.gdshader, outline.language);
+    try testing.expectEqual(SymbolKind.variable, findSymbol(outline, "speed").?.kind);
+    try testing.expectEqual(SymbolKind.variable, findSymbol(outline, "albedo_tex").?.kind);
+    try testing.expectEqual(SymbolKind.constant, findSymbol(outline, "SCALE").?.kind);
+    try testing.expectEqual(SymbolKind.variable, findSymbol(outline, "v_pos").?.kind);
+    try testing.expectEqual(SymbolKind.function, findSymbol(outline, "fragment").?.kind);
+    try testing.expect(findSymbol(outline, "local_value") == null);
+    try testing.expect(findSymbol(outline, "hidden") == null); // inside a block comment
+    try testing.expect(hasImport(outline, "shaders/lib.gdshaderinc"));
+    try testing.expect(!hasImport(outline, "shader_type"));
+}
+
+test "shader: file extensions map to the gdshader language" {
+    try testing.expectEqual(explore.Language.gdshader, explore.detectLanguage("shaders/clay.gdshader"));
+    try testing.expectEqual(explore.Language.gdshader, explore.detectLanguage("shaders/common.gdshaderinc"));
+    try testing.expectEqual(explore.Language.unknown, explore.detectLanguage("shaders/notes.txt"));
+}
+
+test "gdscript: an unnamed script is not labelled by its inner class" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var explorer = Explorer.init(arena.allocator());
+
+    const src = "extends Control\n" ++
+        "class HudSlot extends Control:\n" ++
+        "\tfunc _init() -> void:\n" ++
+        "\t\tpass\n";
+    try explorer.indexFile("drive_hud.gd", src);
+
+    const outline = explorer.outlines.get("drive_hud.gd").?;
+    const descriptor = try Explorer.buildOutlineDescriptor(testing.allocator, &outline);
+    defer testing.allocator.free(descriptor);
+    try testing.expect(std.mem.indexOf(u8, descriptor, "HudSlot") == null);
+    try testing.expect(std.mem.indexOf(u8, descriptor, "1 functions") != null or std.mem.indexOf(u8, descriptor, "1 methods") != null);
+}
+
+test "shader: braces inside an include path do not change the scope depth" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var explorer = Explorer.init(arena.allocator());
+
+    const src = "#include \"res://shaders/odd{name}.gdshaderinc\"\n" ++
+        "uniform float after_include = 1.0;\n" ++
+        "void fragment() {\n" ++
+        "\tfloat inside = 1.0;\n" ++
+        "}\n" ++
+        "uniform float after_function = 2.0;\n";
+    try explorer.indexFile("braces.gdshader", src);
+
+    const outline = explorer.outlines.get("braces.gdshader").?;
+    try testing.expect(findSymbol(outline, "after_include") != null);
+    try testing.expect(findSymbol(outline, "after_function") != null);
+    try testing.expect(findSymbol(outline, "inside") == null);
+}
+
+test "tree summary: a GDScript class lists both its functions and its methods" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var explorer = Explorer.init(arena.allocator());
+
+    const src = "class_name Hub\n" ++
+        "extends Control\n" ++
+        "static func helper() -> int:\n" ++
+        "\treturn 1\n" ++
+        "static func other() -> int:\n" ++
+        "\treturn 2\n" ++
+        "class Inner extends Control:\n" ++
+        "\tfunc _draw() -> void:\n" ++
+        "\t\tpass\n";
+    try explorer.indexFile("hub.gd", src);
+
+    const outline = explorer.outlines.get("hub.gd").?;
+    const descriptor = try Explorer.buildOutlineDescriptor(testing.allocator, &outline);
+    defer testing.allocator.free(descriptor);
+    try testing.expect(std.mem.indexOf(u8, descriptor, "class_def Hub") != null);
+    try testing.expect(std.mem.indexOf(u8, descriptor, "2 functions") != null);
+    try testing.expect(std.mem.indexOf(u8, descriptor, "1 methods") != null);
 }

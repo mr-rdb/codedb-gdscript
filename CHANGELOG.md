@@ -20,8 +20,39 @@
 - **`codedb_callers`** ignores `#` comments and strings in GDScript.
 - **Ignore rules**: `.mono/` joins `.godot/` and `.import/`, and any directory holding a `.gdignore`
   file is skipped, as Godot does. Both the initial scan and incremental updates honor it.
+- **Godot shaders**: `.gdshader` and `.gdshaderinc` files are outlined. Uniforms, varyings, consts,
+  structs, shader functions, and `#include` paths are listed; function-local declarations are not.
+- **GDScript symbols**: function-local `var` and `const` are no longer listed. `signal` is its own
+  kind instead of `constant`. Function parameter and return types feed `codedb_types`. A top-level
+  `extends` on the line after `class_name` shows in `codedb_hierarchy`, which now lists every derived
+  type, the same set `codedb_query` `type_compat` returns. An unnamed script is no longer labelled by
+  its first inner class, and outline summaries report functions and methods together.
+- **`codedb_query` `type_compat`** reports the files that declare the derived types, so a
+  `class_name` script is no longer missed.
+- **`codedb_status`** shows `search_extra_files`: the files outside the trigram index that the fallback
+  search tier covers.
 - After upgrading, restart the MCP server and run `codedb_index` with `force=true`. Symbol spans for
   GDScript change, and cached indexes are keyed by path.
+
+### Search coverage, binary files, and line endings (all languages)
+
+- **Unscoped search** now reaches every indexed file. Files past the 64 KB trigram cap, and files
+  loaded outline-only from a snapshot, were searched only by identifier lookups, so a punctuated or
+  multi-word query such as `res://shaders/` could silently miss them. Those files are now searched too.
+- **Binary files** are skipped by name for Blender (`.blend`), `.glb`, `.fbx`, and binary `.res`/`.scn`,
+  among others. The content check reads the first 8000 bytes, as git does, instead of 512, so a binary
+  file with a NUL-free header is no longer indexed as text.
+- **CRLF files** keep their scope. Blank lines in a file with Windows line endings no longer end a
+  GDScript inner class early, which had marked later methods as plain functions.
+- **Globs**: a pattern with no `/` matches file names at any depth, as in `.gitignore`. `*.gdshader`
+  now finds the same files as `**/*.gdshader`, in `codedb_glob` and in every `path_glob`.
+- **`codedb_outline` with `grouped=true`** includes a `[signal]` section. Signals were missing from it.
+- **`codedb_status` `stale_files`** counts only files that should be indexed and are not. Files
+  excluded by design (binary assets, lockfiles, oversized files) are no longer counted, and deleted
+  files are not counted either.
+- **Idle `seq`**: the background watcher no longer records a new version for files it cannot hash
+  (skipped by rule) or for files whose content it has not yet hashed and whose size and mtime have not
+  changed. Before, `seq` climbed on every verification sweep, even with no edits.
 
 ### 4.0.0 - 4.0.7 â€” ASP.NET accuracy and reliability
 

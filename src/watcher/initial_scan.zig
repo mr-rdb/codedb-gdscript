@@ -90,10 +90,7 @@ fn parseInitialScanEntry(io: std.Io, dir: std.Io.Dir, entry: InitialScanEntry, a
     if (stat.size > skip_rules.max_indexed_file_bytes) return null;
     const content = try project_file.readAlloc(io, dir, entry.path, arena_alloc, .limited(skip_rules.max_indexed_file_bytes));
     if (ssas_security.containsSensitiveContent(entry.path, content)) return null;
-    const check_len = @min(content.len, 512);
-    for (content[0..check_len]) |c| {
-        if (c == 0) return null;
-    }
+    if (skip_rules.isBinaryContent(content)) return null;
     const effective_skip_trigram = entry.skip_trigram or (content.len > 64 * 1024);
     const parsed = try explore_mod.Explorer.parseContentForIndexing(arena_alloc, entry.path, content);
     return .{
@@ -195,10 +192,7 @@ fn readFileEntry(io: std.Io, dir: std.Io.Dir, entry: InitialScanEntry, arena_all
     if (stat.size > skip_rules.max_indexed_file_bytes) return null;
     const c = project_file.readAlloc(io, dir, entry.path, arena_alloc, .limited(skip_rules.max_indexed_file_bytes)) catch return null;
     if (ssas_security.containsSensitiveContent(entry.path, c)) return null;
-    const check_len = @min(c.len, 512);
-    for (c[0..check_len]) |ch| {
-        if (ch == 0) return null;
-    }
+    if (skip_rules.isBinaryContent(c)) return null;
     return .{ .path = entry.path, .content = c };
 }
 
@@ -522,9 +516,6 @@ pub fn indexFileOutline(io: std.Io, explorer: *Explorer, dir: std.Io.Dir, path: 
     if (stat.size > skip_rules.max_indexed_file_bytes) return;
     const content = try project_file.readAlloc(io, dir, path, allocator, .limited(skip_rules.max_indexed_file_bytes));
     defer allocator.free(content);
-    const check_len = @min(content.len, 512);
-    for (content[0..check_len]) |c| {
-        if (c == 0) return;
-    }
+    if (skip_rules.isBinaryContent(content)) return;
     try explorer.indexFileOutlineOnly(path, content);
 }

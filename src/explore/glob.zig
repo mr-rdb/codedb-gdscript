@@ -1,11 +1,20 @@
 // codedb — glob pattern matching for path filters.
 const std = @import("std");
 
+/// Shared by codedb_glob and every `path_glob` filter. A pattern with no `/`
+/// matches the basename at any depth, as in .gitignore, so `*.gdshader` finds
+/// the same files as `**/*.gdshader`. Patterns that contain `/` stay anchored
+/// to the project root.
+///
 /// Brace alternation (`{a,b}`) is expanded before matching, so
 /// `**/*.{cs,cshtml}` and `src/{Foo,Bar}Controller.cs` behave as in a shell.
 /// Groups may nest and alternatives may be empty (`file{,.bak}.txt`). A `{`
 /// with no matching `}` is an ordinary character.
 pub fn matchGlob(pattern: []const u8, path: []const u8) bool {
+    if (std.mem.indexOfScalar(u8, pattern, '/') == null) {
+        const base = if (std.mem.lastIndexOfScalar(u8, path, '/')) |sep| path[sep + 1 ..] else path;
+        return matchBraces(pattern, base, 0);
+    }
     return matchBraces(pattern, path, 0);
 }
 

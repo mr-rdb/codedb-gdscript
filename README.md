@@ -124,11 +124,12 @@ flowchart TD
 
 codedb indexes GDScript (`.gd`) and Godot's text formats: scenes (`.tscn`), resources (`.tres`), and `project.godot`.
 
-- **Outlines** list `func`, `signal`, `var` (with `@export`), `const`, `enum`, `class_name`, inner classes, and decorators. Function, inner-class, and enum bodies span their real line range, so `codedb_symbol` with `body=true` returns the whole body.
+- **Outlines** list `func`, `signal`, `var` (with `@export`), `const`, `enum`, `class_name`, inner classes, and decorators. Function, inner-class, and enum bodies span their real line range, so `codedb_symbol` with `body=true` returns the whole body. Function-local `var` and `const` are not listed. Functions carry their parameter and return types, which `codedb_types` searches.
+- **Shaders** (`.gdshader`, `.gdshaderinc`) list uniforms, varyings, consts, structs, shader functions, and `#include` paths.
 - **Scenes** list the node tree and every `[connection]`. The connection's target script is recorded, so a caller of a handler shows its wiring, e.g. `pressed -> _on_pressed (scripts/x.gd)`.
 - **Dependencies** (`codedb_deps`) follow `preload`/`load`, `extends`, `ext_resource` entries, and `[autoload]` singletons, all by `res://` path. Paths resolve against the nearest `project.godot`, so nested projects in a monorepo stay separate.
 - **Type and class references** link a file to the declaring `class_name`: `extends Foo`, annotations such as `var x: Foo` or `-> Foo`, and `Foo.member` calls. A `Foo.member` call also links to an autoload named `Foo`.
-- **Ignored**: `.godot/`, `.import/`, and `.mono/` directories; `.uid`, `.import`, and `.translation` files; and any directory holding a `.gdignore` file, which is Godot's own convention.
+- **Ignored**: `.godot/`, `.import/`, and `.mono/` directories; `.uid`, `.import`, and `.translation` files; binary assets such as `.blend`, `.glb`, and the binary `.res` and `.scn` formats; and any directory holding a `.gdignore` file, which is Godot's own convention.
 
 Limits: only capitalized names count as `Name.member` references, so lowercase autoload names are not linked. A connection is linked only when its target node appears earlier in the file, which is how Godot writes them. Names that appear only in comments and strings are ignored.
 
@@ -461,7 +462,7 @@ by that root's own cache. A child root never implicitly expands to its parent.
   `max_results`.
 - `codedb_routes` lists controller actions with their routes. Output is paged ("showing 1-5 of 13
   routes"); filter with `controller`, `method` or `path_glob`, and page with `max_results`/`offset`.
-- `path_glob` supports `*`, `**`, `?` and brace alternation such as `{Models,Portfolios}/*.{cshtml,js}`.
+- `path_glob` supports `*`, `**`, `?` and brace alternation such as `{Models,Portfolios}/*.{cshtml,js}`. A pattern with no `/` matches file names at any depth, as in `.gitignore`: `*.gdshader` finds every shader, the same as `**/*.gdshader`.
 - `codedb_deps direction="imported_by"` now includes type-usage edges for C#/F#/JVM and
   TypeScript-style files. Return types, parameter types, fields, and properties can create
   dependency edges, so entity files surface repository/service/controller dependents even

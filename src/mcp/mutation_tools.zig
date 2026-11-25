@@ -14,6 +14,7 @@ const AgentRegistry = @import("../agent.zig").AgentRegistry;
 const edit_mod = @import("../edit.zig");
 const snapshot_json = @import("../snapshot_json.zig");
 const watcher = @import("../watcher.zig");
+const skip_rules = @import("../watcher/skip_rules.zig");
 const telemetry_mod = @import("../telemetry.zig");
 const mcp_lib = @import("mcp");
 const mcpj = mcp_lib.json;
@@ -298,6 +299,7 @@ pub fn handleStatus(alloc: std.mem.Allocator, out: *std.ArrayList(u8), store: *S
         .mmap_overlay => "mmap+overlay",
     };
     const trigram_files = explorer.trigram_index.fileCount();
+    const tier3_files = explorer.skip_trigram_files.count();
     explorer.mu.unlockShared();
 
     const ignore_patterns = explorer.getIgnorePatterns(alloc) catch &.{};
@@ -314,6 +316,7 @@ pub fn handleStatus(alloc: std.mem.Allocator, out: *std.ArrayList(u8), store: *S
         \\  outlines: {d}
         \\  contents_cached: {d}
         \\  trigram_index: {s} ({d} files)
+        \\  search_extra_files: {d} (not in trigram_index; searched by the fallback tier)
         \\  index_memory: {d}KB
         \\  scan: {s}
         \\
@@ -324,6 +327,7 @@ pub fn handleStatus(alloc: std.mem.Allocator, out: *std.ArrayList(u8), store: *S
         content_count,
         trigram_type,
         trigram_files,
+        tier3_files,
         index_bytes / 1024,
         getScanState().name(),
     }) catch {};
@@ -404,29 +408,40 @@ pub fn handleStatus(alloc: std.mem.Allocator, out: *std.ArrayList(u8), store: *S
     // Stale files — tracked in the store but missing from the index.
     // Snapshot store keys (duped) under the store lock, then check outlines
     // under the explorer lock to avoid nested lock ordering.
-    var stale_candidates = std.ArrayList([]const u8).empty;
+    // A candidate is a live store entry (latest version is not a tombstone)
+    // with its size. Deleted files are not stale.
+    const StaleCandidate = struct { path: []const u8, size: u64 };
+    var stale_candidates = std.ArrayList(StaleCandidate).empty;
     defer {
-        for (stale_candidates.items) |k| alloc.free(k);
+        for (stale_candidates.items) |c| alloc.free(c.path);
         stale_candidates.deinit(alloc);
     }
     store.mu.lock();
     {
         var sit = store.files.iterator();
         while (sit.next()) |entry| {
+            const latest = entry.value_ptr.latest() orelse continue;
+            if (latest.op == .tombstone) continue;
             const dup = alloc.dupe(u8, entry.key_ptr.*) catch continue;
-            stale_candidates.append(alloc, dup) catch {
+            stale_candidates.append(alloc, .{ .path = dup, .size = latest.size }) catch {
                 alloc.free(dup);
             };
         }
     }
     store.mu.unlock();
+    // Stale means a file that should be indexed and is not. Files excluded by
+    // design (binary assets, lockfiles, sensitive or generated paths, files
+    // over the size cap) are tracked for change history but are not stale.
     var stale: usize = 0;
     explorer.mu.lockShared();
-    for (stale_candidates.items) |k| {
-        if (!explorer.outlines.contains(k)) stale += 1;
+    for (stale_candidates.items) |c| {
+        if (explorer.outlines.contains(c.path)) continue;
+        if (skip_rules.isExcludedFromIndex(c.path)) continue;
+        if (c.size > skip_rules.max_indexed_file_bytes) continue;
+        stale += 1;
     }
     explorer.mu.unlockShared();
-    w.print("  stale_files: {d} (tracked in store, not indexed)\n", .{stale}) catch {};
+    w.print("  stale_files: {d} (indexable files missing from the index)\n", .{stale}) catch {};
 }
 
 pub fn handleSnapshot(alloc: std.mem.Allocator, out: *std.ArrayList(u8), explorer: *Explorer, store: *Store, cache: *SnapshotCache) void {

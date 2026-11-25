@@ -18,6 +18,8 @@ pub const SymbolKind = enum(u8) {
     method,
     class_def,
     interface_def,
+    /// GDScript `signal`. Appended last so existing snapshot ordinals keep their meaning.
+    signal,
 };
 
 pub const Symbol = struct {
@@ -138,6 +140,9 @@ pub const Language = enum(u8) {
     ssas_tabular,
     ssas_cube,
     ssas_project,
+    /// Godot shading language (.gdshader, .gdshaderinc). Appended last so
+    /// existing snapshot ordinals keep their meaning.
+    gdshader,
 };
 
 pub fn detectLanguage(path: []const u8) Language {
@@ -189,6 +194,7 @@ pub fn detectLanguage(path: []const u8) Language {
     if (std.mem.endsWith(u8, path, ".rds")) return .ssrs_datasource;
     if (std.mem.endsWith(u8, path, ".rptproj")) return .ssrs_project;
     if (std.mem.endsWith(u8, path, ".gd")) return .gdscript;
+    if (std.mem.endsWith(u8, path, ".gdshader") or std.mem.endsWith(u8, path, ".gdshaderinc")) return .gdshader;
     if (std.mem.endsWith(u8, path, ".tscn")) return .godot_scene;
     if (std.mem.endsWith(u8, path, ".tres")) return .godot_resource;
     // Exact basename: "myproject.godot" is not a Godot project file.

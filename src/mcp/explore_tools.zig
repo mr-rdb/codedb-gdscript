@@ -235,28 +235,33 @@ fn writeOutlineSymbolsText(
     }
 }
 
+/// Section order for `codedb_outline grouped=true`. Every SymbolKind must be
+/// listed, or its symbols silently drop out of grouped output (signals did).
+/// A test checks that this list covers the whole enum.
+pub const grouped_outline_kinds = [_]explore_mod.SymbolKind{
+    .class_def,
+    .interface_def,
+    .trait_def,
+    .struct_def,
+    .enum_def,
+    .union_def,
+    .impl_block,
+    .method,
+    .function,
+    .test_decl,
+    .constant,
+    .variable,
+    .signal,
+    .type_alias,
+    .macro_def,
+    .import,
+    .comment_block,
+};
+
 fn writeGroupedOutline(alloc: std.mem.Allocator, out: *std.ArrayList(u8), outline: *const explore_mod.FileOutline, compact: bool) void {
-    const kinds = [_]explore_mod.SymbolKind{
-        .class_def,
-        .interface_def,
-        .trait_def,
-        .struct_def,
-        .enum_def,
-        .union_def,
-        .impl_block,
-        .method,
-        .function,
-        .test_decl,
-        .constant,
-        .variable,
-        .type_alias,
-        .macro_def,
-        .import,
-        .comment_block,
-    };
     const w = cio.listWriter(out, alloc);
     var emitted_any = false;
-    for (kinds) |kind| {
+    for (grouped_outline_kinds) |kind| {
         var count_for_kind: usize = 0;
         var line_start: u32 = std.math.maxInt(u32);
         var line_end: u32 = 0;
@@ -311,7 +316,7 @@ fn symbolKindRank(kind: explore_mod.SymbolKind) u8 {
     return switch (kind) {
         .class_def, .interface_def, .struct_def, .enum_def, .union_def, .trait_def, .type_alias => 0,
         .function, .method => 1,
-        .constant, .variable => 2,
+        .constant, .variable, .signal => 2,
         .macro_def, .impl_block, .test_decl, .comment_block => 3,
         .import => 4,
     };
@@ -491,7 +496,10 @@ pub fn handleHierarchy(alloc: std.mem.Allocator, args: *const std.json.ObjectMap
                 w.writeAll("      bases:\n") catch {};
                 const before = out.items.len;
                 writeHierarchyBaseNames(w, detail, sym.name, "        ");
-                if (out.items.len == before) w.writeAll("        (none)\n") catch {};
+                // Bases that are not on the declaration line itself, such as
+                // GDScript's `extends` on the line after `class_name`, come
+                // from the type graph.
+                if (out.items.len == before) writeGraphBases(explorer, w, name);
             }
         }
     }
@@ -513,9 +521,55 @@ pub fn handleHierarchy(alloc: std.mem.Allocator, args: *const std.json.ObjectMap
             w.print("  // {s}\n", .{detail}) catch {};
         }
     }
+    // Derived types whose base is not on their declaration line (GDScript:
+    // `extends` on the line after `class_name`) come from the type graph. A
+    // type the loop above already listed is skipped, so the lists agree with
+    // codedb_query's type_compat.
+    const graph_derived = explorer.type_graph.getDerived(name);
+    defer explorer.allocator.free(graph_derived);
+    for (graph_derived) |d| {
+        if (std.mem.eql(u8, d, name)) continue;
+        if (findHierarchyDefinition(explorer, d)) |def| {
+            if (def.sym.detail) |detail| {
+                if (hierarchyDetailMentionsBase(detail, def.sym.name, name)) continue;
+            }
+            derived_count += 1;
+            w.print("    {s}:{d} {s} ({s})", .{ def.path, def.sym.line_start, def.sym.name, @tagName(def.sym.kind) }) catch {};
+            w.print("  // extends {s}\n", .{name}) catch {};
+        } else {
+            derived_count += 1;
+            w.print("    {s}  // extends {s}\n", .{ d, name }) catch {};
+        }
+    }
     if (derived_count == 0) {
         w.writeAll("    (none)\n") catch {};
     }
+}
+
+const HierarchyDef = struct { path: []const u8, sym: explore_mod.Symbol };
+
+/// First hierarchy-kind declaration named `name` across the outlines (caller holds the shared lock).
+fn findHierarchyDefinition(explorer: *Explorer, name: []const u8) ?HierarchyDef {
+    var iter = explorer.outlines.iterator();
+    while (iter.next()) |entry| {
+        for (entry.value_ptr.symbols.items) |sym| {
+            if (isHierarchySymbolKind(sym.kind) and std.mem.eql(u8, sym.name, name)) {
+                return .{ .path = entry.key_ptr.*, .sym = sym };
+            }
+        }
+    }
+    return null;
+}
+
+/// Bases recorded in the type graph for `name` (caller holds the shared lock).
+fn writeGraphBases(explorer: *Explorer, w: anytype, name: []const u8) void {
+    const graph_bases = explorer.type_graph.getBases(name);
+    defer explorer.allocator.free(graph_bases);
+    if (graph_bases.len == 0) {
+        w.writeAll("        (none)\n") catch {};
+        return;
+    }
+    for (graph_bases) |b| w.print("        {s}\n", .{b}) catch {};
 }
 
 fn isHierarchySymbolKind(kind: explore_mod.SymbolKind) bool {

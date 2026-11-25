@@ -205,15 +205,38 @@ fn excludeToolDirs() bool {
     return !std.mem.eql(u8, v, "0") and !std.ascii.eqlIgnoreCase(v, "false");
 }
 
+/// Binary-to-the-core formats, skipped by name before any read. A content
+/// sniff (`isBinaryContent`) backs this up for extensions not listed here.
 const skip_extensions = [_][]const u8{
-    ".png",     ".jpg",  ".jpeg", ".gif",  ".bmp",    ".ico",         ".icns",  ".webp",
-    ".svg",     ".ttf",  ".otf",  ".woff", ".woff2",  ".eot",         ".zip",   ".tar",
-    ".gz",      ".bz2",  ".xz",   ".7z",   ".rar",    ".pdf",         ".doc",   ".docx",
-    ".xls",     ".xlsx", ".pptx", ".mp3",  ".mp4",    ".wav",         ".avi",   ".mov",
-    ".flv",     ".ogg",  ".webm", ".exe",  ".dll",    ".so",          ".dylib", ".o",
-    ".a",       ".lib",  ".wasm", ".pyc",  ".pyo",    ".class",       ".db",    ".sqlite",
-    ".sqlite3", ".lock", ".sum",  ".uid",  ".import", ".translation",
+    ".png",     ".jpg",   ".jpeg", ".gif",  ".bmp",    ".ico",         ".icns",  ".webp",
+    ".svg",     ".ttf",   ".otf",  ".woff", ".woff2",  ".eot",         ".zip",   ".tar",
+    ".gz",      ".bz2",   ".xz",   ".7z",   ".rar",    ".pdf",         ".doc",   ".docx",
+    ".xls",     ".xlsx",  ".pptx", ".mp3",  ".mp4",    ".wav",         ".avi",   ".mov",
+    ".flv",     ".ogg",   ".webm", ".exe",  ".dll",    ".so",          ".dylib", ".o",
+    ".a",       ".lib",   ".wasm", ".pyc",  ".pyo",    ".class",       ".db",    ".sqlite",
+    ".sqlite3", ".lock",  ".sum",  ".uid",  ".import", ".translation",
+    // Blender scenes (.blend, .blend1 backups) and binary model/texture/audio
+    // assets. Godot's binary resource and packed-scene formats (.res, .scn)
+    // are binary too; their text siblings (.tres, .tscn) are not matched here.
+    // Generic extensions (.bin, .dat) are left to the content sniff, since some
+    // of them hold text.
+    ".blend", ".blend1",
+    ".blend2",  ".glb",   ".fbx",  ".exr",  ".hdr",    ".tga",         ".psd",   ".dds",
+    ".ktx",     ".basis", ".ctex", ".res",  ".scn",    ".pck",         ".m4a",   ".aac",
+    ".flac",    ".mkv",   ".ogv",  ".ttc",
 };
+
+/// Bytes sniffed from the start of a file for a NUL. Matches git's own
+/// text/binary heuristic. A 512-byte window missed binaries whose header
+/// happens to be NUL-free.
+const binary_sniff_bytes = 8000;
+
+/// True when the content looks binary: a NUL byte in its first
+/// `binary_sniff_bytes`. Use this everywhere a file is about to be indexed as text.
+pub fn isBinaryContent(content: []const u8) bool {
+    const n = @min(content.len, binary_sniff_bytes);
+    return std.mem.indexOfScalar(u8, content[0..n], 0) != null;
+}
 
 /// Lockfile basenames — these are generated, binary-like, and pollute the word index.
 const skip_lockfile_names = [_][]const u8{
@@ -231,6 +254,22 @@ const skip_lockfile_names = [_][]const u8{
 };
 
 pub fn shouldSkipFile(path: []const u8) bool {
+    if (excludedByName(path)) return true;
+    if (!shouldIncludeGenerated() and isGeneratedPath(path)) {
+        _ = generated_skip_events.fetchAdd(1, .monotonic);
+        return true;
+    }
+    return false;
+}
+
+/// Pure form of shouldSkipFile: true when a file is excluded from indexing by
+/// design. It bumps no counters, so status code can ask without side effects.
+pub fn isExcludedFromIndex(path: []const u8) bool {
+    return excludedByName(path) or (!shouldIncludeGenerated() and isGeneratedPath(path));
+}
+
+/// Exclusions decided from the path alone: extension, lockfile name, sensitive path.
+fn excludedByName(path: []const u8) bool {
     for (skip_extensions) |ext| {
         if (std.mem.endsWith(u8, path, ext)) return true;
     }
@@ -239,12 +278,7 @@ pub fn shouldSkipFile(path: []const u8) bool {
         if (eqlAsciiIgnoreCase(basename, lock_name)) return true;
     }
     if (std.mem.endsWith(u8, path, ".DS_Store")) return true;
-    if (isSensitivePath(path)) return true;
-    if (!shouldIncludeGenerated() and isGeneratedPath(path)) {
-        _ = generated_skip_events.fetchAdd(1, .monotonic);
-        return true;
-    }
-    return false;
+    return isSensitivePath(path);
 }
 
 // Sensitive-path filter lives in path_safety.zig (shared with snapshot writer

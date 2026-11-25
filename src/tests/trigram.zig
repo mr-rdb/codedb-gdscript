@@ -891,3 +891,56 @@ test "issue-447: searchContent surfaces large (>64KB) skip-trigram files for com
     }
     try testing.expect(found_canonical);
 }
+
+test "search coverage: outline-only and size-capped files are still found by unscoped search" {
+    // A file past the trigram size cap, or loaded outline-only from a snapshot,
+    // has no trigram posting. Punctuated queries reach such files only through
+    // tier 3, so each must be listed in skip_trigram_files. Before the fix the
+    // outline-only file was missed whenever another file already matched.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var explorer = Explorer.init(arena.allocator());
+
+    try explorer.indexFile("small.gd", "const P = \"res://shaders/s.gdshader\"\n");
+    try explorer.indexFileOutlineOnly("big.gd", "extends Node\nconst SHADER = \"res://shaders/t.gdshader\"\n");
+
+    const results = try explorer.searchContent("res://shaders/", testing.allocator, 50);
+    defer {
+        for (results) |r| {
+            testing.allocator.free(r.path);
+            testing.allocator.free(r.line_text);
+        }
+        testing.allocator.free(results);
+    }
+    try testing.expectEqual(@as(usize, 2), results.len);
+}
+
+test "search coverage: rebuilding trigrams keeps files past the size cap searchable" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var explorer = Explorer.init(arena.allocator());
+
+    // Over 64 KB: rebuildTrigrams skips it, so only the coverage reconcile can
+    // keep it reachable for tier 3.
+    var big: std.ArrayList(u8) = .empty;
+    defer big.deinit(testing.allocator);
+    try big.appendSlice(testing.allocator, "extends Node\nconst SHADER = \"res://shaders/big.gdshader\"\n");
+    while (big.items.len <= 70 * 1024) try big.appendSlice(testing.allocator, "# filler padding line to pass the cap\n");
+
+    try explorer.indexFileOutlineOnly("big.gd", big.items);
+    try explorer.indexFile("small.gd", "const P = \"res://shaders/s.gdshader\"\n");
+    try explorer.rebuildTrigrams();
+
+    try testing.expect(explorer.skip_trigram_files.contains("big.gd"));
+    try testing.expect(!explorer.skip_trigram_files.contains("small.gd"));
+
+    const results = try explorer.searchContent("res://shaders/big", testing.allocator, 50);
+    defer {
+        for (results) |r| {
+            testing.allocator.free(r.path);
+            testing.allocator.free(r.line_text);
+        }
+        testing.allocator.free(results);
+    }
+    try testing.expectEqual(@as(usize, 1), results.len);
+}

@@ -119,7 +119,10 @@ pub fn incrementalLoop(io: std.Io, store: *Store, explorer: *Explorer, queue: *E
             // Seed sweep half 1 (#591 Task 5): a walked file the explorer has
             // never indexed was created while the server was down (and, for
             // non-git projects, missed by the git reconcile). Index it now.
+            // Files excluded by design (binary, lockfile, oversized) are never
+            // indexed, so they are not "missing" and record no version here.
             const missing = blk: {
+                if (skip_rules.isExcludedFromIndex(entry.path) or stat.size > skip_rules.max_indexed_file_bytes) break :blk false;
                 explorer.mu.lockShared();
                 defer explorer.mu.unlockShared();
                 break :blk !explorer.outlines.contains(entry.path);
@@ -347,6 +350,19 @@ fn incrementalDiff(io: std.Io, store: *Store, explorer: *Explorer, queue: *Event
                 old.size = stat.size;
                 continue;
             }
+            // A file with no content hash (skipped by rule or oversized) has
+            // nothing to compare. Only an mtime or size change is a change, so
+            // a verify sweep over it records no new version. Before this, every
+            // sweep bumped the store seq for each such file.
+            if (old.size == stat.size and hash == 0 and old.hash == 0 and old.mtime == mtime) continue;
+            // First content hash for a file seen at startup. Its size and mtime
+            // match the snapshot it was loaded from, so this sets the baseline
+            // without recording a version. Any later edit changes mtime or size
+            // and is recorded as usual.
+            if (old.size == stat.size and hash != 0 and old.hash == 0 and old.mtime == mtime) {
+                old.hash = hash;
+                continue;
+            }
 
             const seq = try store.recordSnapshot(entry.path, stat.size, hash);
             old.mtime = mtime;
@@ -413,9 +429,9 @@ pub fn indexFileContent(io: std.Io, explorer: *Explorer, dir: std.Io.Dir, path: 
         explorer.removeFile(path);
         return error.SensitiveContent;
     }
-    const check_len = @min(content.len, 512);
-    for (content[0..check_len]) |c| {
-        if (c == 0) { explorer.removeFile(path); return; }
+    if (skip_rules.isBinaryContent(content)) {
+        explorer.removeFile(path);
+        return;
     }
     const effective_skip_trigram = skip_trigram or (content.len > 64 * 1024);
     if (effective_skip_trigram) {

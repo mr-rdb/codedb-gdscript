@@ -293,6 +293,15 @@ pub fn isStubLikeOutline(outline: *const FileOutline) bool {
     return outline.line_count > 0 and outline.line_count <= 80 and sym_count > 0 and sym_count <= 2;
 }
 
+/// Which type names the file's identity. A GDScript file is one class, the
+/// one named by `class_name`. Its inner `class X:` blocks are nested types and
+/// must not label an unnamed script.
+fn isPrimaryTypeSymbol(language: Language, sym: Symbol) bool {
+    if (language != .gdscript or sym.kind != .class_def) return true;
+    const detail = sym.detail orelse return false;
+    return std.mem.startsWith(u8, detail, "class_name ");
+}
+
 pub fn buildOutlineDescriptor(allocator: std.mem.Allocator, outline: *const FileOutline) ![]const u8 {
     var functions: usize = 0;
     var methods: usize = 0;
@@ -309,7 +318,7 @@ pub fn buildOutlineDescriptor(allocator: std.mem.Allocator, outline: *const File
             .method => methods += 1,
             .class_def, .interface_def, .trait_def, .struct_def, .enum_def => {
                 types_count += 1;
-                if (first_type == null) first_type = sym;
+                if (first_type == null and isPrimaryTypeSymbol(outline.language, sym)) first_type = sym;
             },
             .import => imports_count += 1,
             else => {},
@@ -341,10 +350,15 @@ pub fn buildOutlineDescriptor(allocator: std.mem.Allocator, outline: *const File
     if (route_actions > 0) {
         try appendFmt(allocator, &buf, "; {d} routes", .{route_actions});
         if (post_actions > 0) try appendFmt(allocator, &buf, ", {d} POST", .{post_actions});
-    } else if (methods > 0) {
-        try appendFmt(allocator, &buf, "; {d} methods", .{methods});
-    } else if (functions > 0 and first_type != null) {
-        try appendFmt(allocator, &buf, "; {d} functions", .{functions});
+    } else {
+        // Report both counts. A GDScript file with a class has top-level
+        // functions and inner-class methods, and hiding either misstates the
+        // file. The header names a count only when no type is named.
+        const header_is_plain = first_type == null and !isStubLikeOutline(outline);
+        const header_has_functions = header_is_plain and functions > 0;
+        const header_has_methods = header_is_plain and functions == 0 and methods > 0;
+        if (functions > 0 and !header_has_functions) try appendFmt(allocator, &buf, "; {d} functions", .{functions});
+        if (methods > 0 and !header_has_methods) try appendFmt(allocator, &buf, "; {d} methods", .{methods});
     }
 
     if (types_count > 1) try appendFmt(allocator, &buf, "; {d} types", .{types_count});

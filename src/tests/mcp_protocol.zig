@@ -1891,3 +1891,104 @@ test "issue-591: index-dependent responses carry a freshness envelope" {
     bench_ctx.runDispatch(io, testing.allocator, .codedb_status, &empty.value.object, &status_out, &store, &explorer, &agents);
     try testing.expect(std.mem.indexOf(u8, status_out.items, "index: root=") == null);
 }
+
+test "glob: a pattern without a slash matches the basename at any depth" {
+    // Same rule for codedb_glob and every path_glob filter, as in .gitignore.
+    try testing.expect(mcp_mod.globMatch("*.gdshader", "clay.gdshader"));
+    try testing.expect(mcp_mod.globMatch("*.gdshader", "shaders/clay.gdshader"));
+    try testing.expect(mcp_mod.globMatch("*.gdshader", "a/b/c/clay.gdshader"));
+    try testing.expect(mcp_mod.globMatch("*.{gd,tscn}", "scenes/x/main.tscn"));
+    try testing.expect(!mcp_mod.globMatch("*.gdshader", "shaders/clay.gd"));
+    // Patterns with a slash stay anchored to the project root.
+    try testing.expect(mcp_mod.globMatch("shaders/*.gdshader", "shaders/clay.gdshader"));
+    try testing.expect(!mcp_mod.globMatch("shaders/*.gdshader", "a/shaders/clay.gdshader"));
+    try testing.expect(!mcp_mod.globMatch("src/*.zig", "src/a/b.zig"));
+}
+
+test "codedb_hierarchy and type_compat agree on GDScript classes with a base on a separate line" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var explorer = Explorer.init(arena.allocator());
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+    var agents = AgentRegistry.init(testing.allocator);
+    defer agents.deinit();
+    _ = try agents.register("__filesystem__");
+    var bench_ctx = mcp_mod.BenchContext.init(testing.allocator, ".");
+    defer bench_ctx.deinit();
+
+    // One inner class (same-line extends) and two top-level classes whose
+    // base is on the line after class_name. All three must be listed.
+    try explorer.indexFile("ui/panel.gd", "class Rule extends Control:\n\tfunc _init() -> void:\n\t\tpass\n");
+    try explorer.indexFile("ui/affliction_bar.gd", "class_name AfflictionBar\nextends Control\n");
+    try explorer.indexFile("ui/loot_icon.gd", "class_name LootIcon\nextends Control\n");
+
+    const hier_args = try std.json.parseFromSlice(std.json.Value, testing.allocator, "{\"name\":\"Control\"}", .{});
+    defer hier_args.deinit();
+    var hier_out: std.ArrayList(u8) = .empty;
+    defer hier_out.deinit(testing.allocator);
+    bench_ctx.runDispatch(io, testing.allocator, .codedb_hierarchy, &hier_args.value.object, &hier_out, &store, &explorer, &agents);
+    try testing.expect(std.mem.indexOf(u8, hier_out.items, "Rule") != null);
+    try testing.expect(std.mem.indexOf(u8, hier_out.items, "AfflictionBar") != null);
+    try testing.expect(std.mem.indexOf(u8, hier_out.items, "LootIcon") != null);
+
+    const query_args = try std.json.parseFromSlice(std.json.Value, testing.allocator, "{\"pipeline\":[{\"op\":\"type_compat\",\"name\":\"Control\"}]}", .{});
+    defer query_args.deinit();
+    var query_out: std.ArrayList(u8) = .empty;
+    defer query_out.deinit(testing.allocator);
+    bench_ctx.runDispatch(io, testing.allocator, .codedb_query, &query_args.value.object, &query_out, &store, &explorer, &agents);
+    try testing.expect(std.mem.indexOf(u8, query_out.items, "3 types implementing 'Control'") != null);
+    // Three types, each in its own file: the stage counts files, not types.
+    try testing.expect(std.mem.indexOf(u8, query_out.items, "0: type_compat (3 files)") != null);
+}
+
+const et_mod = @import("../mcp/explore_tools.zig");
+const mt_mod = @import("../mcp/mutation_tools.zig");
+const SymKind = @import("../explore.zig").SymbolKind;
+
+test "codedb_outline grouped=true lists every symbol kind, including signals" {
+    // Every SymbolKind needs a section, or its symbols vanish from grouped output.
+    inline for (@typeInfo(SymKind).@"enum".fields) |f| {
+        const kind = @field(SymKind, f.name);
+        var listed = false;
+        for (et_mod.grouped_outline_kinds) |k| {
+            if (k == kind) listed = true;
+        }
+        try testing.expect(listed);
+    }
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var explorer = Explorer.init(arena.allocator());
+    try explorer.indexFile("enemy.gd", "class_name Enemy\nsignal died\nfunc f() -> void:\n\tpass\n");
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, "{\"path\":\"enemy.gd\",\"grouped\":true}", .{});
+    defer parsed.deinit();
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    et_mod.handleOutline(testing.allocator, &parsed.value.object, &out, &explorer);
+    try testing.expect(std.mem.indexOf(u8, out.items, "[signal]") != null);
+    try testing.expect(std.mem.indexOf(u8, out.items, "died") != null);
+}
+
+test "codedb_status stale_files counts only indexable files missing from the index" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var explorer = Explorer.init(arena.allocator());
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+
+    // Excluded by design: binary asset, and a file the index never reads.
+    _ = try store.recordSnapshot("Assets.blend", 100, 0);
+    _ = try store.recordSnapshot("art/logo.import", 10, 0);
+    // Indexable and missing: the only stale file.
+    _ = try store.recordSnapshot("scripts/gone.gd", 10, 0);
+    // Deleted: not stale.
+    _ = try store.recordSnapshot("scripts/old.gd", 10, 0);
+    _ = try store.recordDelete("scripts/old.gd", 0);
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    mt_mod.handleStatus(testing.allocator, &out, &store, &explorer);
+    try testing.expect(std.mem.indexOf(u8, out.items, "stale_files: 1 ") != null);
+}

@@ -114,10 +114,36 @@ pub fn run(ctx: *shared.Context, step: *const std.json.ObjectMap, step_i: usize,
         }
         // Build file set from derived types' definitions
         if (!ctx.have_set.*) {
+            // The files that declare each derived type. A type's declaration is
+            // not a return-type hit, so the type index alone misses class_name
+            // scripts: every file that defines the type is listed.
             for (derived) |derived_name| {
-                const hits = ctx.explorer.type_index.findByReturnType(derived_name);
-                for (hits) |hit| {
-                    const duped = ctx.alloc.dupe(u8, hit.path) catch continue;
+                const defs = ctx.explorer.findAllSymbols(derived_name, ctx.alloc) catch continue;
+                defer {
+                    for (defs) |d| {
+                        ctx.alloc.free(d.path);
+                        ctx.alloc.free(d.symbol.name);
+                        if (d.symbol.detail) |dd| ctx.alloc.free(dd);
+                        for (d.symbol.decorators) |decorator| ctx.alloc.free(decorator);
+                        if (d.symbol.decorators.len > 0) ctx.alloc.free(d.symbol.decorators);
+                        if (d.symbol.return_type) |rt| ctx.alloc.free(rt);
+                        for (d.symbol.param_types) |pt| ctx.alloc.free(pt);
+                        if (d.symbol.param_types.len > 0) ctx.alloc.free(d.symbol.param_types);
+                    }
+                    ctx.alloc.free(defs);
+                }
+                for (defs) |d| {
+                    if (!isTypeKind(d.symbol.kind)) continue;
+                    // Several derived types can share a file; list each file once.
+                    var already = false;
+                    for (ctx.file_set.items) |existing| {
+                        if (std.mem.eql(u8, existing, d.path)) {
+                            already = true;
+                            break;
+                        }
+                    }
+                    if (already) continue;
+                    const duped = ctx.alloc.dupe(u8, d.path) catch continue;
                     ctx.file_set.append(ctx.alloc, duped) catch {
                         ctx.alloc.free(duped);
                         continue;
@@ -128,4 +154,12 @@ pub fn run(ctx: *shared.Context, step: *const std.json.ObjectMap, step_i: usize,
         }
     }
     return true;
+}
+
+/// Declaration kinds that name a type (the things type_compat can derive).
+fn isTypeKind(kind: explore_mod.SymbolKind) bool {
+    return switch (kind) {
+        .class_def, .interface_def, .struct_def, .enum_def, .trait_def, .type_alias => true,
+        else => false,
+    };
 }

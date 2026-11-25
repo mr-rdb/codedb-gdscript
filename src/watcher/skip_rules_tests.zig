@@ -110,3 +110,26 @@ test "godot: cache dirs and sidecar files are skipped" {
     try testing.expect(!skip_rules.shouldSkipFile("CardData.tres"));
     try testing.expect(!skip_rules.shouldSkipFile("project.godot"));
 }
+
+test "binary content: a NUL anywhere in the first 8000 bytes marks the file binary" {
+    // A 512-byte window let binaries with a NUL-free header through as text.
+    var late_nul: [4096]u8 = undefined;
+    @memset(&late_nul, 'a');
+    late_nul[3000] = 0;
+    try testing.expect(skip_rules.isBinaryContent(&late_nul));
+
+    try testing.expect(!skip_rules.isBinaryContent("extends Node\nvar x: int = 1\n"));
+    try testing.expect(!skip_rules.isBinaryContent(""));
+}
+
+test "binary assets: Blender, Godot binary resources and packed scenes are skipped by name" {
+    try testing.expect(skip_rules.shouldSkipFile("Assets.blend"));
+    try testing.expect(skip_rules.shouldSkipFile("props/Assets.blend1"));
+    try testing.expect(skip_rules.shouldSkipFile("models/Game.glb"));
+    try testing.expect(skip_rules.shouldSkipFile("data/cache.res"));
+    try testing.expect(skip_rules.shouldSkipFile("data/level.scn"));
+    // Text siblings are still indexed.
+    try testing.expect(!skip_rules.shouldSkipFile("data/cache.tres"));
+    try testing.expect(!skip_rules.shouldSkipFile("scenes/main.tscn"));
+    try testing.expect(!skip_rules.shouldSkipFile("shaders/clay.gdshader"));
+}
